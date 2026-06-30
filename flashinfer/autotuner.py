@@ -1237,7 +1237,6 @@ class AutoTuner:
                                 except torch.cuda.OutOfMemoryError:
                                     raise
                                 except Exception as e:
-                                    skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
                                     logger.debug(
                                         f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
@@ -1246,17 +1245,64 @@ class AutoTuner:
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
 
-                                    # Clear any pending async CUDA errors (e.g.
-                                    # cudaErrorIllegalInstruction from a failed
-                                    # kernel warmup run) so they don't surface
-                                    # later during CUDA graph capture.
-                                    # torch.cuda.synchronize() surfaces the error
-                                    # but does NOT clear the sticky CUDA error flag;
-                                    # only cudaGetLastError() resets it.
+                                    # A profiling failure is one of two very
+                                    # different things:
+                                    #  (a) a merely invalid/unsupported tactic
+                                    #      (e.g. get_valid_tactics returned a
+                                    #      tactic the kernel rejects, or a
+                                    #      recoverable launch error like
+                                    #      too-much-shared-memory) -- safe to skip.
+                                    #  (b) a NON-recoverable ("sticky") CUDA error
+                                    #      -- illegal memory access / illegal
+                                    #      instruction / misaligned address /
+                                    #      unspecified launch failure. A sticky
+                                    #      error corrupts the whole CUDA context:
+                                    #      neither torch.cuda.synchronize() nor
+                                    #      cudaGetLastError() can clear it, so
+                                    #      swallowing it here does NOT recover --
+                                    #      it only defers the crash to an unrelated
+                                    #      later kernel (e.g. the next profile's
+                                    #      warmup, or CUDA graph capture), yielding
+                                    #      a traceback far from the real culprit.
+                                    # Surface the pending error, then read+reset the
+                                    # error flag.  If it was sticky, fail fast with
+                                    # the offending op/tactic/shape instead of
+                                    # masking a real out-of-bounds kernel.
                                     with contextlib.suppress(Exception):
                                         torch.cuda.synchronize()
+                                    last_err = 0
                                     with contextlib.suppress(Exception):
-                                        torch.cuda.cudart().cudaGetLastError()
+                                        last_err = int(torch.cuda.cudart().cudaGetLastError())
+                                    # cudaError_t: 700 cudaErrorIllegalAddress,
+                                    # 715 cudaErrorIllegalInstruction,
+                                    # 716 cudaErrorMisalignedAddress,
+                                    # 719 cudaErrorLaunchFailure.
+                                    _STICKY_CUDA_ERRORS = (700, 715, 716, 719)
+                                    _err_msg = str(e).lower()
+                                    is_sticky = last_err in _STICKY_CUDA_ERRORS or any(
+                                        s in _err_msg
+                                        for s in (
+                                            "illegal memory access",
+                                            "illegal instruction",
+                                            "misaligned address",
+                                            "unspecified launch failure",
+                                        )
+                                    )
+                                    if is_sticky:
+                                        raise RuntimeError(
+                                            f"[Autotuner]: Non-recoverable CUDA error "
+                                            f"(cudaError={last_err}) while profiling "
+                                            f"{custom_op} runner={r.__class__.__name__} "
+                                            f"tactic={tac} shapes={shapes}. The CUDA "
+                                            f"context is corrupted and autotuning cannot "
+                                            f"safely continue. This indicates a real "
+                                            f"illegal/out-of-bounds access for this "
+                                            f"(runner, tactic, shape); it must be fixed "
+                                            f"or excluded, not silently skipped. "
+                                            f"Original error: {e}"
+                                        ) from e
+
+                                    skipped_count += 1
 
                                     # Record the failed profiling combinations
                                     if (
