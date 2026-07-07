@@ -45,6 +45,7 @@ TORCH_COMPILE_FNS = [
     flashinfer.decode.single_decode_with_kv_cache,
     flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run,
     flashinfer.gemm.bmm_fp8,
+    flashinfer.gemm.gemm_gated_act,
     flashinfer.gemm.SegmentGEMMWrapper.run,
     flashinfer.norm.rmsnorm,
     flashinfer.norm.fused_add_rmsnorm,

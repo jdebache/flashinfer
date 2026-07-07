@@ -20,6 +20,10 @@ from .gemm_base import (
 )
 from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
+from .gemm_base import gemm_gated_act as gemm_gated_act
+from .gemm_base import (
+    prepare_gated_act_gemm_weights as prepare_gated_act_gemm_weights,
+)
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
@@ -104,6 +108,8 @@ __all__ = (
         "group_deepgemm_fp8_nt_groupwise",
         "gemm_fp8_nt_blockscaled",
         "gemm_fp8_nt_groupwise",
+        "gemm_gated_act",
+        "prepare_gated_act_gemm_weights",
         "group_gemm_fp8_nt_groupwise",
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",

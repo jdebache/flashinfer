@@ -73,6 +73,7 @@ from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
+    gen_gemm_gated_act_sm90_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
@@ -529,6 +530,20 @@ def gen_all_modules(
         jit_specs.append(gen_bgmv_moe_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
+            # Fused gated-activation GEMM (SM90a)
+            for (dtype_a, dtype_out), activation in product(
+                [
+                    (torch.bfloat16, torch.bfloat16),
+                    (torch.float16, torch.float16),
+                    (torch.float8_e4m3fn, torch.bfloat16),
+                    (torch.float8_e4m3fn, torch.float16),
+                    (torch.float8_e4m3fn, torch.float8_e4m3fn),
+                ],
+                ["silu", "gelu", "relu"],
+            ):
+                jit_specs.append(
+                    gen_gemm_gated_act_sm90_module(dtype_a, dtype_out, activation)
+                )
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())

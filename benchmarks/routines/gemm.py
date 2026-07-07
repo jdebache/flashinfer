@@ -54,6 +54,8 @@ def run_gemm_test(args):
         return testBmmBf16(args)
     elif args.routine == "tinygemm_bf16":
         return testTinygemmBf16(args)
+    elif args.routine == "gemm_gated_act":
+        return testGemmGatedAct(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -157,8 +159,20 @@ def parse_gemm_args(line, parser):
             "auto",
             "tinygemm",
             "cutile",
+            "unfused",
         ],
-        help="Kernel backends to test. Default: cudnn",
+        help=(
+            "Kernel backends to test. Default: cudnn. 'unfused' is only valid for "
+            "gemm_gated_act and benchmarks the two-kernel GEMM + silu_and_mul flow."
+        ),
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        required=False,
+        default="silu",
+        choices=["silu", "gelu", "relu"],
+        help="Gate activation for gemm_gated_act.",
     )
     parser.add_argument(
         "--use_128x4_sf_layout",
@@ -205,6 +219,11 @@ def parse_gemm_args(line, parser):
     if args.routine == "mm_bf16_fp4":
         if not has_backends_arg:
             args.backends = ["cute-dsl"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
+    if args.routine == "gemm_gated_act":
+        if not has_backends_arg:
+            args.backends = ["cutlass"]
         if not has_input_dtype_arg:
             args.input_dtype = "bfloat16"
     if args.verbose >= 1:
@@ -2420,6 +2439,231 @@ def testBmmBf16(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["backend"] = backend_name
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testGemmGatedAct(args):
+    """
+    Test gemm_gated_act API (fused gated-activation GEMM, SM90a).
+
+    Computes out[m, n] = (a @ w_up.T) * act(a @ w_gate.T) where the weight
+    packs [W_up ; W_gate] as [2n, k]. Backends:
+    - "cutlass": the fused single-kernel path.
+    - "unfused": the current production flow (gate_up GEMM -> silu_and_mul),
+      as the comparison baseline. Only supports silu.
+
+    This test:
+    1. Generates random input tensors (bf16 / fp16 / fp8_e4m3 per --input_dtype)
+    2. Runs the selected backends
+    3. Runs reference check against an fp32 torch reference
+    4. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testGemmGatedAct")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = list(args.backends)
+    m = args.m
+    n = args.n  # intermediate size (output columns); weight is [2n, k]
+    k = args.k
+    activation = args.activation
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    autotune_supported_backends = ["cutlass"]
+    res = []
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+
+    ## Prepare input tensors
+    a_ref = torch.randn([m, k], device=device, dtype=torch.float32) / 8
+    w_ref = torch.randn([2 * n, k], device=device, dtype=torch.float32) / 8
+    alpha = None
+    out_scale = None
+    if input_dtype == torch.float8_e4m3fn:
+        a, a_inv_s = to_float8(a_ref)
+        weight, w_inv_s = to_float8(w_ref)
+        # alpha scales the accumulators before the nonlinear activation.
+        alpha = float(a_inv_s * w_inv_s)
+    elif input_dtype in (torch.bfloat16, torch.float16):
+        a = a_ref.to(input_dtype)
+        weight = w_ref.to(input_dtype)
+    else:
+        raise ValueError(f"Unsupported input dtype: {args.input_dtype}")
+
+    reference_output = None
+    # Reference over the ACTUAL kernel inputs (post-quantization): alpha carries
+    # the fp8 dequant scales, so pairing it with the unquantized weight would
+    # mis-scale the gate inside the nonlinear activation.
+    intermediate_ref = (
+        a.to(torch.float32)
+        @ weight.to(torch.float32).T
+        * (alpha if alpha is not None else 1.0)
+    )
+    act_fn = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}[activation]
+    reference_output = intermediate_ref[:, :n] * act_fn(intermediate_ref[:, n:])
+    if out_dtype == torch.float8_e4m3fn:
+        out_amax = reference_output.abs().amax().clamp(min=1e-12)
+        out_scale = (torch.finfo(torch.float8_e4m3fn).max / out_amax).reshape(1).float()
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {a.shape = }")
+        print(f"[VVERBOSE] {a.dtype = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+        print(f"[VVERBOSE] {out_dtype = }")
+        print(f"[VVERBOSE] {activation = }")
+        print(f"[VVERBOSE] {alpha = }")
+
+    def run_unfused(a, weight):
+        # Production baseline: gate_up GEMM then silu_and_mul. silu_and_mul
+        # expects [gate | up] while `weight` is [up ; gate]: build the swapped
+        # weight once outside the timed lambda.
+        y = torch.matmul(a, unfused_weight.T)
+        return flashinfer.activation.silu_and_mul(y)
+
+    unfused_weight = None
+    if "unfused" in backends:
+        if input_dtype == torch.float8_e4m3fn or activation != "silu":
+            print(
+                "[INFO] unfused baseline only supports 16-bit inputs with silu; skipping"
+            )
+            backends.remove("unfused")
+        else:
+            unfused_weight = torch.cat([weight[n:], weight[:n]], dim=0).contiguous()
+
+    def run_backend(backend, a, weight):
+        if backend == "cutlass":
+            return flashinfer.gemm_gated_act(
+                a,
+                weight,
+                activation=activation,
+                alpha=alpha,
+                out_scale=out_scale,
+                out_dtype=out_dtype,
+                backend=backend,
+            )
+        elif backend == "unfused":
+            return run_unfused(a, weight)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Programmatically filter backends
+    backends_to_remove = []
+    for backend in backends:
+        try:
+            run_backend(backend, a, weight)
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+    for backend in backends_to_remove:
+        backends.remove(backend)
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
+
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if cur_backend in autotune_supported_backends:
+                if args.verbose >= 1:
+                    print(
+                        f"[INFO] Autotune warmup for gemm_gated_act: {warmup_iters} iters"
+                    )
+                with autotune(True):
+                    for _ in range(warmup_iters):
+                        run_backend(cur_backend, a, weight)
+
+    # Storage for timing results and outputs
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, a, weight).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(cur_backend, a, weight),
+        )
+
+    if run_refcheck and reference_output is not None:
+        for tested_backend, tested_output in outputs.items():
+            tested = tested_output.float()
+            if tested_output.dtype == torch.float8_e4m3fn and out_scale is not None:
+                tested = tested / out_scale
+            cos_sim = F.cosine_similarity(
+                reference_output.reshape(-1), tested.reshape(-1), dim=0
+            )
+            if cos_sim < 0.99:
+                print(
+                    f"[ERROR] Output tensor mismatch from backend {tested_backend} with cos_sim={cos_sim}"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {tested_backend} output mismatch with cos_sim={cos_sim}"
+                    )
+
+    for backend in backends:
+        backend_name = backend + (
+            "_autotune"
+            if (
+                getattr(args, "autotune", False)
+                and backend in autotune_supported_backends
+            )
+            else ""
+        )
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+            problem_flops = 2 * m * (2 * n) * k  # the fused gate_up GEMM
+            # Ideal (fused) traffic; the unfused baseline additionally round-trips
+            # the [m, 2n] intermediate, which shows up as lower effective TB/sec.
+            problem_bytes = (
+                m * k * input_dtype.itemsize
+                + 2 * n * k * input_dtype.itemsize
+                + m * n * out_dtype.itemsize
+            )
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+            print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["out_dtype"] = str(out_dtype)
+                cur_res["backend"] = backend_name
+                cur_res["activation"] = activation
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

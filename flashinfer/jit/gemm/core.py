@@ -840,6 +840,83 @@ def gen_gemm_sm90_module() -> JitSpec:
     )
 
 
+# Maps the `activation` argument of flashinfer.gemm_gated_act to a stateless
+# CUTLASS activation functor (applied at fp32 inside the fused epilogue).
+gated_act_cutlass_activation_map = {
+    "silu": "cutlass::epilogue::thread::SiLu",
+    "gelu": "cutlass::epilogue::thread::GELU",
+    "relu": "cutlass::epilogue::thread::ReLu",
+}
+
+_dl_dtype_name_map = {
+    torch.float16: "dl_float16",
+    torch.bfloat16: "dl_bfloat16",
+    torch.float8_e4m3fn: "dl_float8_e4m3fn",
+}
+
+
+def gen_gemm_gated_act_sm90_module(
+    dtype_a: torch.dtype, dtype_out: torch.dtype, activation: str
+) -> JitSpec:
+    """Fused gated-activation GEMM (CUTLASS example 113 lineage), SM90a only.
+
+    One module per (input dtype, output dtype, activation) so JIT compiles
+    only the two schedule variants (pingpong/cooperative) actually used.
+    """
+    if activation not in gated_act_cutlass_activation_map:
+        raise ValueError(
+            f"Unsupported activation {activation!r}; expected one of "
+            f"{sorted(gated_act_cutlass_activation_map)}"
+        )
+    name_a = filename_safe_dtype_map[dtype_a]
+    name_out = filename_safe_dtype_map[dtype_out]
+    uri = f"gemm_gated_act_sm90_{name_a}_{name_out}_{activation}"
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = []
+    # Fp8 output keeps a 16-bit bias (the kernel's ElementC is half_t there).
+    dtype_bias = (
+        dtype_out if dtype_out in (torch.bfloat16, torch.float16) else torch.float16
+    )
+    template_args = {
+        "dtype_in": dtype_cutlass_map[dtype_a],
+        "dtype_out": dtype_cutlass_map[dtype_out],
+        "dl_dtype_in": _dl_dtype_name_map[dtype_a],
+        "dl_dtype_out": _dl_dtype_name_map[dtype_out],
+        "dl_dtype_bias": _dl_dtype_name_map[dtype_bias],
+        "activation": gated_act_cutlass_activation_map[activation],
+    }
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "gemm_gated_act_sm90_kernel_inst.jinja"
+    ) as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+    for schedule, pingpong in [("pingpong", "true"), ("cooperative", "false")]:
+        dest_path = gen_directory / f"gemm_gated_act_{schedule}_sm90.cu"
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(pingpong=pingpong, **template_args)
+        write_if_different(dest_path, source)
+    with open(jit_env.FLASHINFER_CSRC_DIR / "gemm_gated_act_sm90.jinja") as f:
+        launcher_templ = jinja2.Template(f.read())
+    dest_path = gen_directory / "gemm_gated_act_sm90.cu"
+    source_paths.append(dest_path)
+    write_if_different(dest_path, launcher_templ.render(**template_args))
+    for filename in ["gemm_gated_act_sm90_jit_binding.cu"]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=sm90a_nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
+        ],
+    )
+
+
 def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
     header_name = "flashinferMetaInfo"

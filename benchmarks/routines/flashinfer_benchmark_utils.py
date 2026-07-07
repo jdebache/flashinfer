@@ -32,6 +32,7 @@ output_column_dict = {
     ],
     "gemm": [
         "n",
+        "activation",
         "group_size",
         "tile_size",
         "scale_major_mode",
@@ -206,6 +207,7 @@ benchmark_apis = {
         "mm_bf16",
         "bmm_bf16",
         "tinygemm_bf16",
+        "gemm_gated_act",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",

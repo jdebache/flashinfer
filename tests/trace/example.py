@@ -21,6 +21,7 @@ gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
+gemm_gated_act_N228672_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
@@ -351,6 +352,15 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── Fused gated-activation GEMM (SM90a: Llama-3-8B FC1, M×4096→14336) ───────
+# weight packs [W_up ; W_gate] as [2N, K]; trace is dumped before kernel
+# launch, so suppress failures on non-SM90 devices.
+with contextlib.suppress(Exception):
+    M, K, N = 128, 4096, 14336
+    a_ga = torch.randn(M, K, dtype=torch.bfloat16, device=device) / 64
+    w_ga = torch.randn(2 * N, K, dtype=torch.bfloat16, device=device) / 64
+    flashinfer.gemm_gated_act(a_ga, w_ga, activation="silu")
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.

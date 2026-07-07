@@ -30,6 +30,7 @@ from .core import (
     gen_trtllm_low_latency_gemm_module,
     gen_tgv_gemm_sm10x_module,
     gen_gemm_sm90_module,
+    gen_gemm_gated_act_sm90_module,
 )
 from .deepgemm import gen_deepgemm_sm100_module
 from .fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
@@ -50,6 +51,7 @@ __all__ = [
     "gen_trtllm_low_latency_gemm_module",
     "gen_tgv_gemm_sm10x_module",
     "gen_gemm_sm90_module",
+    "gen_gemm_gated_act_sm90_module",
     "gen_deepgemm_sm100_module",
     "gen_fp8_blockscale_gemm_sm90_module",
 ]

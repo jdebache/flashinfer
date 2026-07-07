@@ -1916,3 +1916,72 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
     reference=_trtllm_ragged_attention_deepseek_reference,
     init=_trtllm_ragged_attention_deepseek_init,
 )
+
+# ── Fused gated-activation GEMM (SM90) ───────────────────────────────────────
+
+
+def _gemm_gated_act_reference(A, W):
+    """Unfused reference: split W into [W_up ; W_gate] halves and compute
+    ``(A @ W_up.T) * silu(A @ W_gate.T)``.
+    """
+    intermediate = W.shape[0] // 2
+    w_up = W[:intermediate].to(torch.float32)
+    w_gate = W[intermediate:].to(torch.float32)
+    a_fp32 = A.to(torch.float32)
+    up = torch.matmul(a_fp32, w_up.T)
+    gate = torch.matmul(a_fp32, w_gate.T)
+    return (up * torch.nn.functional.silu(gate)).to(A.dtype)
+
+
+def _gemm_gated_act_init(
+    *,
+    M: int,
+    N: int = 14336,
+    K: int = 4096,
+    N2: int = 0,  # derived (= 2 * N)
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm_gated_act``.
+
+    ``weight`` packs the up/value projection rows first, then the gate rows
+    (the kernel-native packing; see ``prepare_gated_act_gemm_weights`` for
+    repacking from the HF ``[gate ; up]`` convention).
+    """
+    del N2
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    weight = torch.randn(2 * N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    return {"a": a, "weight": weight}
+
+
+gemm_gated_act_trace = TraceTemplate(
+    op_type="gemm_gated_act",
+    description=(
+        "Fused gated-activation GEMM (gated-MLP FC1): "
+        "out = (a @ w_up.T) * act(a @ w_gate.T) in a single kernel. "
+        "weight is [2N, K] row-major packing [W_up ; W_gate] along dim 0."
+    ),
+    axes={
+        "M": Var(),
+        "N2": Const(description="Packed weight rows (2 * output intermediate size)."),
+        "N": Var(description="Output intermediate size, derived as N2 // 2."),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a"),
+        "W": Tensor(
+            ["N2", "K"],
+            param="weight",
+            description="Packed [W_up ; W_gate] weight, row-major [2N, K].",
+        ),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="a"),
+    },
+    constraints=["N2 == 2 * N"],
+    tags=["fused"],
+    reference=_gemm_gated_act_reference,
+    check=_gemm_check,
+    init=_gemm_gated_act_init,
+)

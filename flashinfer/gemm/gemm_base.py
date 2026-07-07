@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, Union
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -30,6 +30,7 @@ from ..trace.templates.gemm import (
     bmm_mxfp8_trace,
     fp8_blockscale_gemm_sm90_trace,
     gemm_fp8_nt_groupwise_trace,
+    gemm_gated_act_trace,
     mm_bf16_trace,
     mm_fp4_trace,
     mm_fp8_trace,
@@ -61,6 +62,7 @@ from ..utils import (
     supported_compute_capability,
 )
 from ..jit.gemm import gen_gemm_sm90_module
+from ..jit.gemm import gen_gemm_gated_act_sm90_module
 from ..jit.gemm import gen_gemm_module
 from ..jit.gemm import gen_gemm_sm100_module
 from ..jit.gemm import gen_gemm_sm120_module
@@ -1800,6 +1802,442 @@ def get_gemm_sm90_module():
     return SimpleNamespace(
         cutlass_segment_gemm_sm90=cutlass_segment_gemm_sm90,
     )
+
+
+_GATED_ACT_SUPPORTED_ACTIVATIONS = ("silu", "gelu", "relu")
+# (input dtype, output dtype) pairs with a kernel instantiation. 16-bit inputs
+# keep their dtype on output; e4m3 inputs may dequantize to 16-bit via `alpha`
+# or requantize to e4m3 via `out_scale`.
+_GATED_ACT_SUPPORTED_DTYPES = (
+    (torch.bfloat16, torch.bfloat16),
+    (torch.float16, torch.float16),
+    (torch.float8_e4m3fn, torch.bfloat16),
+    (torch.float8_e4m3fn, torch.float16),
+    (torch.float8_e4m3fn, torch.float8_e4m3fn),
+)
+
+
+def _resolve_gemm_gated_act_out_dtype(
+    a: torch.Tensor,
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+) -> torch.dtype:
+    if out is not None:
+        return out.dtype
+    if out_dtype is not None:
+        return out_dtype
+    return a.dtype if a.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+
+
+@functools.cache
+def get_gemm_gated_act_sm90_module(
+    dtype_a: torch.dtype, dtype_out: torch.dtype, activation: str
+):
+    module = gen_gemm_gated_act_sm90_module(
+        dtype_a, dtype_out, activation
+    ).build_and_load()
+    from ..jit.utils import filename_safe_dtype_map
+
+    op_name = (
+        "gemm_gated_act_sm90_"
+        f"{filename_safe_dtype_map[dtype_a]}_{filename_safe_dtype_map[dtype_out]}_{activation}"
+    )
+
+    @register_custom_op(
+        f"flashinfer::{op_name}",
+        mutates_args=("out", "workspace_buffer"),
+    )
+    def gemm_gated_act_sm90(
+        workspace_buffer: torch.Tensor,
+        a: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        alpha_tensor: Optional[torch.Tensor],
+        out_scale: Optional[torch.Tensor],
+        out: torch.Tensor,
+        alpha: float,
+        sm_count: int,
+        tactic: int,
+    ) -> None:
+        module.gemm_gated_act_sm90(
+            workspace_buffer,
+            a,
+            weight,
+            bias,
+            alpha_tensor,
+            out_scale,
+            out,
+            alpha,
+            sm_count,
+            tactic,
+        )
+
+    @register_fake_op(f"flashinfer::{op_name}")
+    def _fake_gemm_gated_act_sm90(
+        workspace_buffer: torch.Tensor,
+        a: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        alpha_tensor: Optional[torch.Tensor],
+        out_scale: Optional[torch.Tensor],
+        out: torch.Tensor,
+        alpha: float,
+        sm_count: int,
+        tactic: int,
+    ) -> None:
+        pass
+
+    class GatedActSm90Runner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            # 0: pingpong schedule (128x128 tile), 1: cooperative (128x256).
+            return [0, 1]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            (
+                a,
+                weight,
+                bias,
+                alpha_tensor,
+                out_scale,
+                out,
+                workspace_buffer,
+                alpha,
+                sm_count,
+            ) = inputs
+            if tactic < 0:
+                # The token dimension maps to the CUTLASS N tile (128 for
+                # pingpong, 256 for cooperative): prefer cooperative once
+                # there are enough tokens to fill its wider tile.
+                tactic = 1 if a.shape[0] >= 256 else 0
+            gemm_gated_act_sm90(
+                workspace_buffer,
+                a,
+                weight,
+                bias,
+                alpha_tensor,
+                out_scale,
+                out,
+                alpha,
+                sm_count,
+                tactic,
+            )
+            return out
+
+    return SimpleNamespace(
+        gemm_gated_act_sm90=gemm_gated_act_sm90,
+        gemm_gated_act_sm90_runner=GatedActSm90Runner,
+    )
+
+
+_GEMM_GATED_ACT_SM90_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (-2,),  # token (m) dimension
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            5,  # out_tensor_index
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+@supported_compute_capability([90])
+def _cutlass_gemm_gated_act_requirement(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str = "silu",
+    bias: Optional[torch.Tensor] = None,
+    alpha: Optional[Union[float, torch.Tensor]] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    return True
+
+
+def _check_gemm_gated_act_problem_size(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str = "silu",
+    bias: Optional[torch.Tensor] = None,
+    alpha: Optional[Union[float, torch.Tensor]] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    if activation not in _GATED_ACT_SUPPORTED_ACTIVATIONS:
+        raise ValueError(
+            f"Unsupported activation {activation!r}; expected one of "
+            f"{_GATED_ACT_SUPPORTED_ACTIVATIONS}."
+        )
+    if a.dim() != 2 or weight.dim() != 2:
+        raise ValueError(
+            f"a and weight must be 2D, got a.dim()={a.dim()}, weight.dim()={weight.dim()}."
+        )
+    if a.dtype != weight.dtype:
+        raise ValueError(
+            f"a and weight must share a dtype, got {a.dtype} and {weight.dtype}."
+        )
+    if a.shape[1] != weight.shape[1]:
+        raise ValueError(
+            f"K mismatch: a is {tuple(a.shape)}, weight is {tuple(weight.shape)}."
+        )
+    if not a.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("a and weight must be contiguous row-major tensors.")
+    resolved_out_dtype = _resolve_gemm_gated_act_out_dtype(a, out, out_dtype)
+    if (a.dtype, resolved_out_dtype) not in _GATED_ACT_SUPPORTED_DTYPES:
+        raise ValueError(
+            f"Unsupported dtype combination: a/weight {a.dtype} with output "
+            f"{resolved_out_dtype}. Supported (input, output) pairs: "
+            f"{_GATED_ACT_SUPPORTED_DTYPES}."
+        )
+    two_i = weight.shape[0]
+    if two_i % 16 != 0:
+        raise ValueError(
+            f"weight.shape[0] (= 2 * intermediate_size) must be divisible by 16, got {two_i}."
+        )
+    intermediate = two_i // 2
+    # 16-byte TMA alignment on the contiguous dimension of every operand.
+    if a.shape[1] * a.element_size() % 16 != 0:
+        raise ValueError(
+            f"K (= {a.shape[1]}) must give 16-byte aligned rows for dtype {a.dtype}."
+        )
+    out_elt_size = 1 if resolved_out_dtype == torch.float8_e4m3fn else 2
+    if intermediate * out_elt_size % 16 != 0:
+        raise ValueError(
+            f"intermediate_size (= {intermediate}) must give 16-byte aligned output "
+            f"rows for dtype {resolved_out_dtype}."
+        )
+    if out is not None:
+        if out.shape != (a.shape[0], intermediate):
+            raise ValueError(
+                f"Output shape mismatch. Expected {(a.shape[0], intermediate)}, got {tuple(out.shape)}."
+            )
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous.")
+        if out_dtype is not None and out.dtype != out_dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
+            )
+    if bias is not None:
+        if bias.shape != (two_i,):
+            raise ValueError(
+                f"bias must have shape ({two_i},) (packed [b_up ; b_gate]), got {tuple(bias.shape)}."
+            )
+        expected_bias_dtype = (
+            resolved_out_dtype
+            if resolved_out_dtype in (torch.bfloat16, torch.float16)
+            else torch.float16
+        )
+        if bias.dtype != expected_bias_dtype:
+            raise ValueError(
+                f"bias dtype must be {expected_bias_dtype} for output dtype "
+                f"{resolved_out_dtype}, got {bias.dtype}."
+            )
+        if not bias.is_contiguous():
+            raise ValueError("bias must be contiguous.")
+    if resolved_out_dtype == torch.float8_e4m3fn and out_scale is None:
+        raise ValueError("float8_e4m3fn output requires out_scale.")
+    if out_scale is not None:
+        if resolved_out_dtype != torch.float8_e4m3fn:
+            raise ValueError("out_scale is only supported with float8_e4m3fn output.")
+        if out_scale.numel() != 1 or out_scale.dtype != torch.float32:
+            raise ValueError(
+                f"out_scale must be a single-element float32 device tensor, got "
+                f"numel={out_scale.numel()}, dtype={out_scale.dtype}."
+            )
+    if isinstance(alpha, torch.Tensor) and (
+        alpha.numel() != 1 or alpha.dtype != torch.float32
+    ):
+        raise ValueError(
+            f"alpha tensor must be a single-element float32 device tensor, got "
+            f"numel={alpha.numel()}, dtype={alpha.dtype}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutlass": _cutlass_gemm_gated_act_requirement,
+    },
+    common_check=_check_gemm_gated_act_problem_size,
+)
+@flashinfer_api(trace=gemm_gated_act_trace)
+def gemm_gated_act(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str = "silu",
+    bias: Optional[torch.Tensor] = None,
+    alpha: Optional[Union[float, torch.Tensor]] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass"] = "cutlass",
+) -> torch.Tensor:
+    r"""Fused gated-activation GEMM (gated-MLP FC1) on SM90a (Hopper).
+
+    Computes, in a single kernel,
+
+    ``out = out_scale * ((alpha * (a @ w_up.T) + b_up) * act(alpha * (a @ w_gate.T) + b_gate))``
+
+    where ``weight`` packs the up/value projection rows FIRST and the gate rows
+    second along dim 0: ``weight = [W_up ; W_gate]``, each half ``[n, k]``.
+    This is the reverse of the HF/``silu_and_mul`` convention (gate first) —
+    use :func:`prepare_gated_act_gemm_weights` to repack a HF ``gate_up_proj``.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input activations, shape ``(m, k)``, row-major; bf16, fp16 or float8_e4m3fn.
+
+    weight: torch.Tensor
+        Packed weight ``[W_up ; W_gate]``, shape ``(2 * n, k)``, row-major, same
+        dtype as ``a``. ``2 * n`` must be divisible by 16.
+
+    activation: str
+        Gate activation: ``"silu"`` (SwiGLU, default), ``"gelu"`` (GEGLU) or
+        ``"relu"`` (ReGLU). Applied at fp32, compile-time dispatched.
+        Parametric activations (e.g. ``swiglu_limit`` clamping) are not supported.
+
+    bias: Optional[torch.Tensor]
+        Optional packed bias ``[b_up ; b_gate]``, shape ``(2 * n,)``, broadcast over
+        tokens. Must match the (16-bit) output dtype, or fp16 for e4m3 output.
+
+    alpha: Optional[Union[float, torch.Tensor]]
+        Scalar multiplier applied to both accumulators *before* bias-add and
+        activation. For fp8 inputs pass the dequant scale product
+        ``a_scale * weight_scale`` here (it cannot be folded into ``out_scale``
+        because the activation is nonlinear). A float, or a single-element
+        float32 device tensor. Defaults to 1.
+
+    out_scale: Optional[torch.Tensor]
+        Single-element float32 *device* tensor multiplied into the gated result
+        after the activation. Required for (and only supported with)
+        float8_e4m3fn output; pass ``1 / output_quant_scale``.
+
+    out: Optional[torch.Tensor]
+        Preallocated output, shape ``(m, n)``, contiguous.
+
+    out_dtype: Optional[torch.dtype]
+        Output dtype: bf16/fp16 (matching 16-bit inputs), or bf16/fp16/
+        float8_e4m3fn for e4m3 inputs. Defaults to ``a.dtype`` for 16-bit
+        inputs and bf16 for e4m3 inputs.
+
+    backend: Literal["cutlass"]
+        Only ``"cutlass"`` (CUTLASS SM90a fused kernel) is currently supported.
+        The surface is backend-neutral so trtllm-gen (Blackwell) / cuDNN (SM100)
+        backends can be added later.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape ``(m, n)``, row-major.
+
+    Notes
+    -----
+    - Not supported: per-row or blockwise (DeepSeek-style) quantization scales
+      (per-tensor scalars only), parametric activations, SM100+ (use the
+      trtllm/cudnn fused paths there once available).
+    - With fp8 output, a single per-tensor ``out_scale`` is shared by the whole
+      output (same accuracy caveat as TRT-LLM's fused gated GEMM).
+    - The fused result can differ from the unfused two-kernel reference by
+      1-2 ULPs for fp8 outputs since the intermediate stays in fp32 registers.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> a = torch.randn([128, 4096], device="cuda", dtype=torch.bfloat16)
+    >>> w = torch.randn([2 * 14336, 4096], device="cuda", dtype=torch.bfloat16)
+    >>> out = flashinfer.gemm_gated_act(a, w, activation="silu")
+    >>> out.shape
+    torch.Size([128, 14336])
+    """
+    intermediate = weight.shape[0] // 2
+    resolved_out_dtype = _resolve_gemm_gated_act_out_dtype(a, out, out_dtype)
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], intermediate),
+            device=a.device,
+            dtype=resolved_out_dtype,
+        )
+    if isinstance(alpha, torch.Tensor):
+        alpha_tensor, alpha_scalar = alpha, 1.0
+    else:
+        alpha_tensor, alpha_scalar = None, float(alpha) if alpha is not None else 1.0
+    workspace_buffer = _get_cache_buf(
+        "gemm_gated_act_sm90_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    module = get_gemm_gated_act_sm90_module(a.dtype, out.dtype, activation)
+    runner = module.gemm_gated_act_sm90_runner()
+    inputs = [
+        a,
+        weight,
+        bias,
+        alpha_tensor,
+        out_scale,
+        out,
+        workspace_buffer,
+        alpha_scalar,
+        get_device_sm_count(a.device),
+    ]
+    tuner = AutoTuner.get()
+    runner, tactic = tuner.choose_one(
+        "gemm_gated_act_sm90",
+        [runner],
+        _GEMM_GATED_ACT_SM90_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+def prepare_gated_act_gemm_weights(gate_up_proj: torch.Tensor) -> torch.Tensor:
+    r"""Repack a HF-convention fused MLP weight for :func:`gemm_gated_act`.
+
+    HF / :func:`silu_and_mul` pack the gate rows first (``[W_gate ; W_up]``);
+    the fused kernel expects the up/value rows first (``[W_up ; W_gate]``).
+    This is a one-time contiguous block swap of the two halves — no row
+    interleaving.
+
+    Parameters
+    ----------
+    gate_up_proj: torch.Tensor
+        Fused weight, shape ``(2 * n, k)``, packed ``[W_gate ; W_up]``.
+
+    Returns
+    -------
+    torch.Tensor
+        New contiguous tensor, shape ``(2 * n, k)``, packed ``[W_up ; W_gate]``.
+    """
+    if gate_up_proj.dim() != 2 or gate_up_proj.shape[0] % 2 != 0:
+        raise ValueError(
+            f"gate_up_proj must be 2D with an even first dimension, got "
+            f"{tuple(gate_up_proj.shape)}."
+        )
+    intermediate = gate_up_proj.shape[0] // 2
+    return torch.cat(
+        [gate_up_proj[intermediate:], gate_up_proj[:intermediate]], dim=0
+    ).contiguous()
 
 
 def launch_compute_sm80_group_gemm_args(
