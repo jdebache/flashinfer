@@ -431,7 +431,6 @@ quantize_with_block_size_tma(
                 "NVFP4 4over6 requires E4M3 scale factors");
 
   int warpIdx = threadIdx.x / 32;
-  int numWarp = blockDim.x / 32;
   int laneIdx = threadIdx.x % 32;
 
   // IMPORTANT: TMA with SWIZZLE_128B requires 128-byte aligned shared memory.
@@ -469,7 +468,6 @@ quantize_with_block_size_tma(
   // The number of padded rows considering 128x4 or 8x4 SF layout.
   int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
   int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
-  int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
 
   asm volatile("griddepcontrol.wait;");
 
