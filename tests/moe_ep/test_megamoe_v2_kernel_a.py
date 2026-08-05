@@ -1,0 +1,221 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Device test: kernel A -- quantize + dispatch + FC1 fused into one launch.
+
+The staged pipeline already validates the same arithmetic, so what is new here
+is the concurrency: dispatch warps and GEMM warps running at once, meeting only
+at the schedule flag and the per-expert row counters.  The reference is the
+staged path's own FC1 output, so any difference is a fusion bug rather than a
+numerics one.
+
+Failures here tend to be hangs, not wrong answers -- a grid barrier that not
+every block reaches, or a readiness counter that never hits its target.
+
+STATUS: xfail.  The first deadlock (GEMM warps blocking on the schedule flag
+*before* the block-wide pipeline init that the dispatch warps also had to
+reach) is fixed.  What remains is a misaligned shared/local access reported in
+warp 6 -- the TMA-B warp -- on every lane, in every block.  Bisected so far:
+
+* it is not the dispatch work: a prologue trimmed to "write a prefix and set
+  the schedule flag" still faults;
+* it is not the token gate: disabling ``wait_tokens`` does not help;
+* it is not block-dimension/warpgroup alignment: 256, 352 and 384 all fault,
+  and removing the ``setmaxnreg`` calls changes nothing;
+* it does not reproduce with ``dispatch_warps=0``, which is the configuration
+  every other test uses -- so the staged path and all 144 existing tests are
+  unaffected.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("cutlass")
+
+from flashinfer.moe_ep.kernel_src.megamoe_v2 import sf_layout  # noqa: E402
+from flashinfer.moe_ep.kernel_src.megamoe_v2.reference import (  # noqa: E402
+    quantize_nvfp4,
+)
+from flashinfer.moe_ep.kernel_src.megamoe_v2.types import NVFP4_BLOCK  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "_v2_gemm_test", pathlib.Path(__file__).with_name("test_megamoe_v2_gemm.py")
+)
+_gemm_test = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_gemm_test)
+_pack_fp4 = _gemm_test._pack_fp4
+_require_blackwell = _gemm_test._require_blackwell
+_scatter_scales = _gemm_test._scatter_scales
+
+_TILE = 128
+
+
+def _z(*shape, dtype=torch.int32):
+    return torch.zeros(*shape, dtype=dtype, device="cuda")
+
+
+def _build(num_tokens, hidden, intermediate, num_experts, top_k, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    act = torch.randn(
+        num_tokens, hidden, dtype=torch.float32, device="cuda", generator=g
+    ).bfloat16()
+    w1 = (
+        torch.randn(
+            num_experts,
+            2 * intermediate,
+            hidden,
+            dtype=torch.float32,
+            device="cuda",
+            generator=g,
+        )
+        * 0.3
+    )
+    logits = torch.rand(num_tokens, num_experts, device="cuda", generator=g) ** 3
+    topk_ids = logits.topk(top_k, dim=-1).indices.to(torch.int32)
+    topk_ids[::9, -1] = -1
+    topk_weights = torch.rand(
+        num_tokens, top_k, dtype=torch.float32, device="cuda", generator=g
+    )
+    return act, w1, topk_ids, topk_weights
+
+
+def _run_fused(
+    *,
+    num_tokens,
+    hidden,
+    intermediate,
+    num_experts,
+    top_k,
+    clamp=None,
+    seed=5,
+    num_clusters=4,
+):
+    import cutlass.cute as cute
+    import cutlass.torch as ct
+    import cuda.bindings.driver as cuda
+
+    from flashinfer.moe_ep.kernel_src.megamoe_v2.kernel_a import launch_kernel_a
+
+    world = 1
+    le = num_experts
+    max_pairs = num_tokens * top_k
+    pool_rows = (num_tokens * top_k + le * _TILE + _TILE - 1) // _TILE * _TILE
+    h_atoms = sf_layout.num_k_atoms_for(hidden, NVFP4_BLOCK)
+    i_atoms = sf_layout.num_k_atoms_for(intermediate, NVFP4_BLOCK)
+
+    act, w1, topk_ids, topk_weights = _build(
+        num_tokens, hidden, intermediate, num_experts, top_k, seed
+    )
+    qw1 = quantize_nvfp4(w1.reshape(-1, hidden))
+
+    send_b = _z(num_tokens, hidden // 2, dtype=torch.uint8)
+    send_sf_b = _z(
+        sf_layout.buffer_words(max(num_tokens, 128), num_k_atoms=h_atoms) * 4,
+        dtype=torch.uint8,
+    )
+    pool_b = _z(pool_rows, hidden // 2, dtype=torch.uint8)
+    pool_sf_b = _z(
+        sf_layout.buffer_words(pool_rows, num_k_atoms=h_atoms) * 4,
+        dtype=torch.uint8,
+    )
+    fc1_b = _z(pool_rows, intermediate // 2, dtype=torch.uint8)
+    fc1_sf_b = _z(
+        sf_layout.buffer_words(pool_rows, num_k_atoms=i_atoms) * 4,
+        dtype=torch.uint8,
+    )
+
+    mk = lambda t: ct.from_dlpack(t, assumed_align=16)
+    ntok = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    prefix = _z(le + 1)
+    ready = _z(le)
+    coop = (
+        mk(act),
+        mk(topk_ids),
+        mk(topk_weights),
+        mk(send_b.view(torch.float4_e2m1fn_x2)),
+        mk(send_sf_b.view(torch.float8_e4m3fn)),
+        mk(_z(num_experts)),
+        mk(_z(num_experts, max_pairs)),
+        mk(_z(num_experts, max_pairs, dtype=torch.float32)),
+        mk(_z(world * le, dtype=torch.int64)),
+        mk(_z(le * world * max_pairs)),
+        mk(_z(le * world * max_pairs, dtype=torch.float32)),
+        mk(_z(world, dtype=torch.int64)),
+        mk(_z(1)),
+        mk(_z(le, dtype=torch.int64)),
+        mk(_z(le * world)),
+        mk(prefix),
+        mk(send_b.view(torch.int32)),
+        mk(send_sf_b.view(torch.int32)),
+        mk(pool_b.view(torch.int32)),
+        mk(pool_sf_b.view(torch.int32)),
+        mk(_z(pool_rows, dtype=torch.float32)),
+        mk(_z(pool_rows, dtype=torch.int64)),
+        mk(_z(world, dtype=torch.int64)),
+        mk(_z(2)),
+        mk(ready),
+        mk(_z(1)),
+        mk(ntok),
+        mk(torch.tensor([0], dtype=torch.int32, device="cuda")),
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = (
+        mk(_pack_fp4(qw1.codes).view(torch.float4_e2m1fn_x2)),
+        mk(_scatter_scales(qw1.scales)),
+        mk(fc1_b.view(torch.float4_e2m1fn_x2)),
+        mk(fc1_sf_b.view(torch.float8_e4m3fn)),
+        coop,
+        stream,
+    )
+    kw = dict(
+        num_experts=num_experts,
+        local_experts=le,
+        world=world,
+        intermediate=intermediate,
+        hidden=hidden,
+        pool_rows=pool_rows,
+        max_tokens=num_tokens,
+        top_k=top_k,
+        hidden_atoms=h_atoms,
+        inter_atoms=i_atoms,
+        clamp=clamp,
+        num_clusters=num_clusters,
+    )
+    cute.compile(launch_kernel_a, *args, **kw)(*args)
+    torch.cuda.synchronize()
+    return dict(
+        fc1=fc1_b,
+        fc1_sf=fc1_sf_b,
+        prefix=prefix,
+        ready=ready,
+        topk_ids=topk_ids,
+        pool_rows=pool_rows,
+    )
+
+
+# Skipped, not xfailed: the fault is a misaligned address, which is sticky for
+# the whole CUDA context, so merely launching it fails every later test in the
+# process.  Drop the marker to work on it.
+@pytest.mark.skip(
+    reason="fused kernel A faults in the TMA-B warp whenever dispatch warps "
+    "are present; see the module docstring for what is already ruled out"
+)
+def test_kernel_a_runs_and_schedules():
+    """The fused kernel completes, and its device-built schedule is right."""
+    _require_blackwell()
+    r = _run_fused(num_tokens=256, hidden=512, intermediate=256, num_experts=2, top_k=2)
+    counts = [int((r["topk_ids"] == e).sum()) for e in range(2)]
+    blocks = 0
+    for e, c in enumerate(counts):
+        assert int(r["prefix"][e]) == blocks
+        blocks += (c + _TILE - 1) // _TILE
+    assert int(r["prefix"][2]) == blocks
+    # Every expert's rows were published exactly once.
+    for e in range(2):
+        want = (int(r["prefix"][e + 1]) - int(r["prefix"][e])) * _TILE
+        assert int(r["ready"][e]) == want
+    assert r["fc1"].any(), "FC1 produced nothing"

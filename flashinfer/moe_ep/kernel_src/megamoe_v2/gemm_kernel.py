@@ -68,6 +68,7 @@ _THREADS = 32 * _NUM_WARPS
 _TMEM_ALLOC_BARRIER = 1
 _EPI_DONE_BARRIER = 2
 EPI_STAGE_BARRIER = 3
+_PREFIX_BARRIER = 6
 _TMEM_CAPACITY_COLS = 512
 _MMA_INST_TILE_K = 4
 # Epilogue TMEM readback subtile width; 128x64 is the widest a single
@@ -188,6 +189,11 @@ def _grouped_gemm_kernel(
     epi_n: cutlass.Constexpr[int],
     epi_smem_floats: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    dispatch_warps: cutlass.Constexpr[int],
+    prologue: cutlass.Constexpr,
+    wait_schedule: cutlass.Constexpr,
+    wait_tokens: cutlass.Constexpr,
+    coop_args,
 ):
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -227,12 +233,9 @@ def _grouped_gemm_kernel(
             cutlass.Float32, cute.make_layout(epi_smem_floats), 16
         )
 
-    # Every warp reads the prefix, so stage it in smem once up front.
     prefix = cute.make_tensor(
         storage.prefix.data_ptr(), cute.make_layout(num_experts + 1)
     )
-    if tidx < Int32(num_experts + 1):
-        prefix[tidx] = prefix_gmem[tidx]
 
     a_pipe = pipeline.PipelineTmaUmma.create(
         barrier_storage=storage.a_mbar.data_ptr(),
@@ -308,12 +311,30 @@ def _grouped_gemm_kernel(
     tmem.allocate(_TMEM_CAPACITY_COLS)
     pipeline.pipeline_init_wait(cluster_shape_mn=cluster_mn)
 
+    # Dispatch warps leave for the prologue here.  Everything above this point
+    # is block-wide (the pipeline init is a barrier all threads must reach), so
+    # nothing before it may block on work the dispatch warps have not done yet
+    # -- that ordering is exactly what deadlocked the first version.
+    if cutlass.const_expr(dispatch_warps > 0):
+        if warp_idx >= Int32(_NUM_WARPS):
+            prologue(coop_args, tidx - Int32(_NUM_WARPS * 32), bidx, bidz, gdim_z)
+
+    # The prefix is staged by the GEMM warps only, and after the split, because
+    # when dispatch is fused it does not exist until the prologue's plan step.
+    if warp_idx < Int32(_NUM_WARPS):
+        if cutlass.const_expr(dispatch_warps > 0):
+            wait_schedule(coop_args)
+        if tidx < Int32(num_experts + 1):
+            prefix[tidx] = prefix_gmem[tidx]
+        pipeline.NamedBarrier(
+            barrier_id=_PREFIX_BARRIER, num_threads=32 * _NUM_WARPS
+        ).arrive_and_wait()
+
     # The tile count is derived, not passed: the per-expert counts only
     # exist on device once dispatch has run, and `prefix[num_experts]` is
     # already the total token-block count.  Deriving it here keeps one
     # source of truth -- a host-side copy could disagree with the prefix
-    # the warps actually walk.  Safe to read now: the init wait above is
-    # the block-wide barrier that publishes the smem staging.
+    # the warps actually walk.
     total_tiles = prefix[num_experts] * Int32(channel_blocks)
 
     tile_tokens: cutlass.Constexpr[int] = mma_tiler[1]
@@ -327,7 +348,8 @@ def _grouped_gemm_kernel(
 
     # ---------------- TMA-A: weights ----------------
     if warp_idx == _TMA_A_WARP:
-        cute.arch.warpgroup_reg_dealloc(40)
+        if cutlass.const_expr(dispatch_warps == 0):
+            cute.arch.warpgroup_reg_dealloc(40)
         a_mask = None
         sfa_mask = None
         if cutlass.const_expr(two_cta or cute.size(cluster_vmnk.shape[2]) > 1):
@@ -392,7 +414,8 @@ def _grouped_gemm_kernel(
 
     # ---------------- TMA-B: tokens ----------------
     if warp_idx == _TMA_B_WARP:
-        cute.arch.warpgroup_reg_dealloc(40)
+        if cutlass.const_expr(dispatch_warps == 0):
+            cute.arch.warpgroup_reg_dealloc(40)
         b_mask = None
         sfb_mask = None
         if cutlass.const_expr(two_cta or cute.size(cluster_vmnk.shape[1]) > 1):
@@ -423,13 +446,19 @@ def _grouped_gemm_kernel(
 
         tile = cluster_id
         while tile < total_tiles:
-            _e, _ch, token_block, first_tb = decode_tile_device(
+            expert_b, _ch, token_block, first_tb = decode_tile_device(
                 tile,
                 prefix,
                 num_experts=num_experts,
                 channel_blocks=channel_blocks,
                 tile_tokens=tile_tokens,
             )
+            # Per expert, not per kernel: expert 0's rows land long before the
+            # last expert's, and waiting on the whole pool would idle the MMA
+            # -- which would in turn backpressure the weight stream after four
+            # smem stages and undo the overlap entirely.
+            if cutlass.const_expr(dispatch_warps > 0):
+                wait_tokens(coop_args, expert_b)
             # The pool is one flat matrix; an expert's segment start is just
             # its prefix, so the absolute token tile is prefix + local index.
             abs_tb = first_tb + token_block
@@ -472,7 +501,8 @@ def _grouped_gemm_kernel(
 
     # ---------------- MMA ----------------
     if warp_idx == _MMA_WARP:
-        cute.arch.warpgroup_reg_dealloc(40)
+        if cutlass.const_expr(dispatch_warps == 0):
+            cute.arch.warpgroup_reg_dealloc(40)
         tmem.wait_for_alloc()
         acc_ptr = tmem.retrieve_ptr(cutlass.Float32)
         tAccs = tuple(
@@ -578,7 +608,8 @@ def _grouped_gemm_kernel(
 
     # ---------------- epilogue ----------------
     if warp_idx < len(_EPI_WARPS):
-        cute.arch.warpgroup_reg_alloc(232)
+        if cutlass.const_expr(dispatch_warps == 0):
+            cute.arch.warpgroup_reg_alloc(232)
         tmem.wait_for_alloc()
         acc_ptr = tmem.retrieve_ptr(cutlass.Float32)
 
@@ -821,6 +852,11 @@ def launch_grouped_gemm(
     epi_n: cutlass.Constexpr[int] = _EPI_N,
     epi_smem_floats: cutlass.Constexpr[int] = 0,
     use_pdl: cutlass.Constexpr[bool] = False,
+    dispatch_warps: cutlass.Constexpr[int] = 0,
+    prologue: cutlass.Constexpr = None,
+    wait_schedule: cutlass.Constexpr = None,
+    wait_tokens: cutlass.Constexpr = None,
+    coop_args=(),
 ):
     cta_group = tcgen05.CtaGroup.TWO if two_cta else tcgen05.CtaGroup.ONE
     make_mma = lambda: sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -989,9 +1025,14 @@ def launch_grouped_gemm(
         epi_n,
         epi_smem_floats,
         use_pdl,
+        dispatch_warps,
+        prologue,
+        wait_schedule,
+        wait_tokens,
+        coop_args,
     ).launch(
         grid=[cluster_m, 1, num_clusters],
-        block=[_THREADS, 1, 1],
+        block=[32 * (_NUM_WARPS + dispatch_warps), 1, 1],
         cluster=(cluster_m, 1, 1),
         stream=stream,
         use_pdl=use_pdl,
