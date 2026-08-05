@@ -187,7 +187,6 @@ def _run_grouped(
         mk(sfx),
         (mk(c),),
         mk(prefix),
-        cutlass.Int32(layout.total_tiles),
         stream,
     )
     kw = dict(

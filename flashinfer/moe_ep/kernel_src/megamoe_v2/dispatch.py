@@ -266,6 +266,67 @@ def dispatch_push(
 
 
 # --------------------------------------------------------------------------
+# barrier: the one point where a rank must wait for the others
+# --------------------------------------------------------------------------
+
+
+@cute.kernel
+def _barrier_kernel(
+    signal: cute.Tensor,  # (world,) int64, symmetric: slot r is rank r's
+    phase_store: cute.Tensor,  # (1,) int32, rank-private, survives launches
+    peer_offset: cute.Tensor,
+    my_rank: Int32,
+    world: cutlass.Constexpr[int],
+):
+    """Flag-based, sense-carrying barrier across the EP group.
+
+    Each rank publishes a monotonically increasing phase into *its own* slot on
+    every peer, then waits for every slot at home to reach that phase.  Slot
+    ownership is what makes it atomic-free, exactly as in the dispatch
+    metadata push; the phase is monotonic rather than a reset counter so the
+    barrier can be reused without a clearing pass between launches.
+
+    Single-threaded: ``world`` is at most a handful, and the kernel boundary
+    already guarantees this rank's prior work is complete.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    if bidx == Int32(0) and tidx == Int32(0):
+        phase = Int64(phase_store[0]) + Int64(1)
+        phase_store[0] = Int32(phase)
+        # Release everything this rank wrote before anyone can observe the
+        # flag; system scope because the observer is another GPU.
+        cute.arch.fence_acq_rel_sys()
+        for r in cutlass.range_constexpr(world):
+            remote = peer_view(
+                signal, peer_offset[r], signal.layout, cutlass.Int64, align=8
+            )
+            cute.arch.atomic_exch(remote.iterator + my_rank, phase)
+        for r in cutlass.range_constexpr(world):
+            # atomic rather than a plain load: a load in a spin loop is free to
+            # be hoisted, and this must re-read memory every iteration.
+            seen = cute.arch.atomic_add(signal.iterator + r, Int64(0))
+            while seen < phase:
+                seen = cute.arch.atomic_add(signal.iterator + r, Int64(0))
+        cute.arch.fence_acq_rel_sys()
+
+
+@cute.jit
+def dispatch_barrier(
+    signal: cute.Tensor,
+    phase_store: cute.Tensor,
+    peer_offset: cute.Tensor,
+    my_rank: Int32,
+    stream,
+    *,
+    world: cutlass.Constexpr[int],
+):
+    _barrier_kernel(signal, phase_store, peer_offset, my_rank, world).launch(
+        grid=[1, 1, 1], block=[32, 1, 1], stream=stream
+    )
+
+
+# --------------------------------------------------------------------------
 # plan: counts -> pool offsets and the tile prefix
 # --------------------------------------------------------------------------
 

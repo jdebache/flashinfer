@@ -170,7 +170,6 @@ def launch_fc1(
     out_scales: cute.Tensor,  # flat Float8E4M3FN, atom-swizzled over I
     weights: cute.Tensor,  # (pool_rows,) Float32 routing weights
     prefix: cute.Tensor,
-    total_tiles: Int32,
     stream,
     *,
     num_experts: cutlass.Constexpr[int],
@@ -203,7 +202,6 @@ def launch_fc1(
         sf_tokens,
         (out_codes, out_scales, weights),
         prefix,
-        total_tiles,
         stream,
         num_experts=num_experts,
         out_channels=2 * intermediate,

@@ -107,7 +107,6 @@ def _run_fc2(counts, intermediate, hidden, *, num_clusters, seed=17):
         mk(_scatter_scales(qh.scales)),
         mk(out),
         mk(prefix),
-        cutlass.Int32(layout.total_tiles),
         stream,
     )
     kw = dict(
@@ -243,7 +242,6 @@ def _run_chain(counts, intermediate, hidden, *, use_pdl, num_clusters=4, seed=23
         mk(fc1_sf),
         mk(weights),
         mk(p1),
-        cutlass.Int32(layout1.total_tiles),
         stream,
     )
     k1 = dict(
@@ -264,7 +262,6 @@ def _run_chain(counts, intermediate, hidden, *, use_pdl, num_clusters=4, seed=23
         mk(fc1_sf),
         mk(out),
         mk(p2),
-        cutlass.Int32(layout2.total_tiles),
         stream,
     )
     k2 = dict(

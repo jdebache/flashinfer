@@ -168,9 +168,11 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
                 _ALIGN_COUNTER,
                 resettable=True,
             ),
-            # Sense-reversing cross-rank barrier signal.  NOT resettable: the
-            # phase rides across launches.
-            Region("barrier_signal", 2 * _BYTES_I64, _ALIGN_COUNTER),
+            # One slot per source rank: rank r publishes its phase into slot r
+            # of every peer, so the barrier is flag-based and needs no remote
+            # read-modify-write.  NOT resettable -- the phase rides across
+            # launches, and zeroing it would desynchronize the ranks.
+            Region("barrier_signal", world * _BYTES_I64, _ALIGN_COUNTER),
             # --- peer-readable data: quantized once here, pulled by owners ---
             # Quantizing on the source side rather than the pull side keeps
             # NVFP4 (not bf16) on the wire and does the work once per token
@@ -184,6 +186,15 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
                 "send_token_sf",
                 sf_row_capacity(shape.max_tokens_per_rank)
                 * sf_cols_for(shape.hidden, 16),
+                _ALIGN_TMA,
+            ),
+            # Where peers land this rank's FC2 results, one slot per
+            # (top-k slot, token).  Slot ownership is what makes the combine
+            # push a plain store instead of a remote atomic add; the price is
+            # this buffer being `top_k` times the output.
+            Region(
+                "combine_buf",
+                shape.top_k * shape.max_tokens_per_rank * shape.hidden * _BYTES_BF16,
                 _ALIGN_TMA,
             ),
         )

@@ -46,6 +46,81 @@ def stage_floats(cta_tile_m: int, epi_n: int = FC2_EPI_N) -> int:
     return cta_tile_m * (epi_n + 1)
 
 
+def transpose_tile_to_rows(
+    tTR_accs,
+    tiled_t2r,
+    thr_t2r,
+    tidx,
+    stage_smem,
+    abs_tb,
+    store,
+    *,
+    cta_tile_m: int,
+    tile_tokens: int,
+    epi_n: int,
+):
+    """Turn one accumulator tile into token-major bf16 vectors and hand them off.
+
+    ``store(token_row, chunk, vals)`` receives one thread's 8 bf16 channels
+    for one pool row; where they go is the caller's business.  That split is
+    what lets FC2 write a local matrix and the combine variant scatter the
+    same bytes straight into a peer's buffer without a second transpose.
+
+    A plain function, not ``@cute.jit``: it inlines into the caller's region at
+    trace time, so ``store`` can close over dynamic values.
+    """
+    epi_n_sub = tile_tokens // epi_n
+    chunks = cta_tile_m // _STORE_VEC
+    steps = (epi_n * chunks) // _EPI_THREADS
+    tok_base = abs_tb * Int32(tile_tokens)
+
+    stage = cute.make_tensor(
+        stage_smem.iterator,
+        cute.make_layout((cta_tile_m, epi_n), stride=(epi_n + 1, 1)),
+    )
+    tSt = thr_t2r.partition_D(cute.flat_divide(stage, (cta_tile_m, epi_n)))[
+        (None, None, None, 0, 0)
+    ]
+    frag = cute.make_rmem_tensor(tSt.shape, Float32)
+    bar = pipeline.NamedBarrier(barrier_id=EPI_STAGE_BARRIER, num_threads=_EPI_THREADS)
+
+    for sub in range(epi_n_sub):
+        cute.copy(tiled_t2r, tTR_accs[0][(None, None, None, 0, sub)], frag)
+        cute.arch.fence_view_async_tmem_load()
+        # Brackets the staging buffer, which is reused across subtiles.
+        bar.arrive_and_wait()
+        cute.autovec_copy(frag, tSt)
+        bar.arrive_and_wait()
+
+        for step in range(steps):
+            unit = tidx + Int32(step * _EPI_THREADS)
+            # Consecutive lanes take consecutive tokens, so the strided reads
+            # from the staging buffer stay conflict-free.
+            chunk = unit // Int32(epi_n)
+            tok_local = unit % Int32(epi_n)
+            vals = cute.make_rmem_tensor((_STORE_VEC,), cutlass.BFloat16)
+            base = chunk * Int32(_STORE_VEC)
+            for i in range(_STORE_VEC):
+                vals[i] = stage[(base + Int32(i), tok_local)].to(cutlass.BFloat16)
+            store(tok_base + Int32(sub * epi_n) + tok_local, chunk, vals)
+
+
+def store_vector(row_tensor, slot: Int32, vals) -> None:
+    """Store 8 bf16 channels at ``slot`` of a token row, as one 16 B write."""
+    atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        cutlass.BFloat16,
+        num_bits_per_copy=_STORE_VEC * 16,
+    )
+    dst = cute.zipped_divide(row_tensor, (_STORE_VEC,))
+    ptr = dst[(None,), (slot,)].iterator
+    aligned = cute.make_tensor(
+        cute.make_ptr(ptr.dtype, ptr.toint(), ptr.memspace, assumed_align=16),
+        dst[(None,), (slot,)].layout,
+    )
+    cute.copy(atom, vals, aligned)
+
+
 @cute.jit
 def epilogue_fc2(
     tTR_accs,
@@ -71,58 +146,25 @@ def epilogue_fc2(
     for the plain epilogue's benefit (see :func:`..fc1.epilogue_fc1`).
     """
     out_rows = epi_args[0]
-
-    epi_n_sub: cutlass.Constexpr[int] = tile_tokens // epi_n
-    chunks: cutlass.Constexpr[int] = cta_tile_m // _STORE_VEC
-    steps: cutlass.Constexpr[int] = (epi_n * chunks) // _EPI_THREADS
-
     ch_base = (ch_block * Int32(cta_per_mma) + mma_v) * Int32(cta_tile_m)
-    tok_base = abs_tb * Int32(tile_tokens)
 
-    stage = cute.make_tensor(
-        stage_smem.iterator,
-        cute.make_layout((cta_tile_m, epi_n), stride=(epi_n + 1, 1)),
+    def store(token_row, chunk, vals):
+        store_vector(
+            out_rows[token_row, None], ch_base // Int32(_STORE_VEC) + chunk, vals
+        )
+
+    transpose_tile_to_rows(
+        tTR_accs,
+        tiled_t2r,
+        thr_t2r,
+        tidx,
+        stage_smem,
+        abs_tb,
+        store,
+        cta_tile_m=cta_tile_m,
+        tile_tokens=tile_tokens,
+        epi_n=epi_n,
     )
-    tSt = thr_t2r.partition_D(cute.flat_divide(stage, (cta_tile_m, epi_n)))[
-        (None, None, None, 0, 0)
-    ]
-    frag = cute.make_rmem_tensor(tSt.shape, Float32)
-
-    store_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(),
-        cutlass.BFloat16,
-        num_bits_per_copy=_STORE_VEC * 16,
-    )
-    bar = pipeline.NamedBarrier(barrier_id=EPI_STAGE_BARRIER, num_threads=_EPI_THREADS)
-
-    for sub in cutlass.range_constexpr(epi_n_sub):
-        cute.copy(tiled_t2r, tTR_accs[0][(None, None, None, 0, sub)], frag)
-        cute.arch.fence_view_async_tmem_load()
-        bar.arrive_and_wait()
-        cute.autovec_copy(frag, tSt)
-        bar.arrive_and_wait()
-
-        for step in cutlass.range_constexpr(steps):
-            unit = tidx + Int32(step * _EPI_THREADS)
-            # Consecutive lanes take consecutive tokens, so the strided reads
-            # from the staging buffer stay conflict-free.
-            chunk = unit // Int32(epi_n)
-            tok_local = unit % Int32(epi_n)
-            token_row = tok_base + Int32(sub * epi_n) + tok_local
-
-            vals = cute.make_rmem_tensor((_STORE_VEC,), cutlass.BFloat16)
-            base = chunk * Int32(_STORE_VEC)
-            for i in cutlass.range_constexpr(_STORE_VEC):
-                vals[i] = stage[(base + Int32(i), tok_local)].to(cutlass.BFloat16)
-
-            dst = cute.zipped_divide(out_rows[token_row, None], (_STORE_VEC,))
-            slot = ch_base // Int32(_STORE_VEC) + chunk
-            ptr = dst[(None,), (slot,)].iterator
-            aligned = cute.make_tensor(
-                cute.make_ptr(ptr.dtype, ptr.toint(), ptr.memspace, assumed_align=16),
-                dst[(None,), (slot,)].layout,
-            )
-            cute.copy(store_atom, vals, aligned)
 
 
 @cute.jit
@@ -133,7 +175,6 @@ def launch_fc2(
     sf_fc1_out: cute.Tensor,
     out_rows: cute.Tensor,  # (pool_rows, hidden) bf16
     prefix: cute.Tensor,
-    total_tiles: Int32,
     stream,
     *,
     num_experts: cutlass.Constexpr[int],
@@ -157,7 +198,6 @@ def launch_fc2(
         sf_fc1_out,
         (out_rows,),
         prefix,
-        total_tiles,
         stream,
         num_experts=num_experts,
         out_channels=hidden,

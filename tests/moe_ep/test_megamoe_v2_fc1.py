@@ -141,7 +141,6 @@ def _run_fc1(
         mk(out_scales),
         mk(weights),
         mk(prefix),
-        cutlass.Int32(layout.total_tiles),
         stream,
     )
     kw = dict(

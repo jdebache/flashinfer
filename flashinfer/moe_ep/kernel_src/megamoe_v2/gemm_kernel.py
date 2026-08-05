@@ -181,7 +181,6 @@ def _grouped_gemm_kernel(
     k_tiles: cutlass.Constexpr[int],
     num_experts: cutlass.Constexpr[int],
     channel_blocks: cutlass.Constexpr[int],
-    total_tiles: Int32,
     two_cta: cutlass.Constexpr[bool],
     cluster_m: cutlass.Constexpr[int],
     acc_stages: cutlass.Constexpr[int],
@@ -308,6 +307,14 @@ def _grouped_gemm_kernel(
     pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_mn, is_relaxed=True)
     tmem.allocate(_TMEM_CAPACITY_COLS)
     pipeline.pipeline_init_wait(cluster_shape_mn=cluster_mn)
+
+    # The tile count is derived, not passed: the per-expert counts only
+    # exist on device once dispatch has run, and `prefix[num_experts]` is
+    # already the total token-block count.  Deriving it here keeps one
+    # source of truth -- a host-side copy could disagree with the prefix
+    # the warps actually walk.  Safe to read now: the init wait above is
+    # the block-wide barrier that publishes the smem staging.
+    total_tiles = prefix[num_experts] * Int32(channel_blocks)
 
     tile_tokens: cutlass.Constexpr[int] = mma_tiler[1]
     # One cluster = one persistent worker.  Static striding needs no atomics
@@ -796,7 +803,6 @@ def launch_grouped_gemm(
     sfb: cute.Tensor,  # flat Float8E4M3FN, atom-swizzled
     epi_args,  # tuple of output tensors for `epilogue`
     prefix: cute.Tensor,  # (experts + 1,) Int32 exclusive prefix of token tiles
-    total_tiles: Int32,
     stream,
     *,
     num_experts: cutlass.Constexpr[int],
@@ -976,7 +982,6 @@ def launch_grouped_gemm(
         k_tiles,
         num_experts,
         channel_blocks,
-        total_tiles,
         two_cta,
         cluster_m,
         acc_stages,
