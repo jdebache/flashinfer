@@ -78,6 +78,7 @@ import torch
 
 from mpi4py import MPI
 
+from flashinfer.autotuner import autotune
 from flashinfer.comm import MoeAlltoAll
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
@@ -219,6 +220,22 @@ def parse_moe_comm_args(line, parser):
         help="Runs actual MoE kernels (trtllm_(fp4|fp8)_block_scale_moe).",
     )
     parser.add_argument(
+        "--sanitize_expert_ids",
+        action="store_true",
+        help="Pass invalid_token_expert_id=num_experts to dispatch so expert IDs not "
+        "owned by this rank are rewritten to the standard sentinel (vLLM convention) "
+        "instead of being left as arbitrary out-of-range values. Adds a sanitize "
+        "kernel inside the block.",
+    )
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        help="Autotune the MoE compute kernel before timing (requires --real_math). "
+        "The a2a dispatch/combine ops carry no tactics, so this tunes the GEMMs "
+        "only. Without it the MoE runs on default tactics, which at large "
+        "post-dispatch token counts is several times slower than tuned.",
+    )
+    parser.add_argument(
         "--intermediate_size",
         type=int,
         required=False,
@@ -246,6 +263,15 @@ def parse_moe_comm_args(line, parser):
         "--per_phase_timing",
         action="store_true",
         help="Enable per-phase timing (dispatch/combine). Adds slight overhead from CUDA events.",
+    )
+    parser.add_argument(
+        "--collective_timing",
+        action="store_true",
+        help="Time dispatch+compute+combine as ONE block with CUDA events, with a "
+        "cross-rank barrier at each block boundary and a MAX reduction across ranks "
+        "(slowest rank is the real latency of a collective). Use this instead of "
+        "--per_phase_timing: the default bench_gpu_time harness has no cross-rank "
+        "barrier, so ranks free-run and the reported std swamps the median.",
     )
     parser.add_argument(
         "--use_lora",
@@ -1269,6 +1295,11 @@ def test_moe_a2a_dispatch_combine(args):
 
     # Define benchmark function that accepts tensors as arguments
     # This enables automatic buffer rotation by bench_gpu_time
+    # input_payloads[1] is token_selected_experts (see _create_moe_inputs).
+    # Sentinel follows the vLLM convention: invalid experts are marked num_experts.
+    sanitize_expert_ids = getattr(args, "sanitize_expert_ids", False)
+    invalid_expert_id = num_experts if sanitize_expert_ids else None
+
     def run_dispatch_combine(sel_experts, *payloads):
         # Dispatch phase: send (possibly quantized) hidden states to experts
         with (
@@ -1279,6 +1310,8 @@ def test_moe_a2a_dispatch_combine(args):
                 sel_experts,
                 list(payloads),
                 runtime_max_tokens_per_rank,
+                invalid_token_expert_id=invalid_expert_id,
+                expert_id_payload_index=1 if sanitize_expert_ids else None,
             )
 
         # Expert processing in benchmark runs either no-op or real MoE kernel depending on --real_math flag
@@ -1427,18 +1460,70 @@ def test_moe_a2a_dispatch_combine(args):
     comm.Barrier()
     torch.cuda.synchronize()
 
-    # Use bench_gpu_time with cold L2 cache
-    total_times = bench_gpu_time(
-        fn=run_dispatch_combine,
-        input_args=(token_selected_experts, *input_payloads),
-        dry_run_iters=args.dry_run_iters,
-        repeat_iters=args.num_iters,
-        sleep_after_run=False,
-        enable_cupti=args.use_cupti,
-        # Note: disable use_cuda_graph when per_phase_timing=True, which inserts CUDA events in the middle
-        use_cuda_graph=(not args.no_cuda_graph and not enable_per_phase_timing),
-        cold_l2_cache=True,
-    )
+    # Optional autotune warmup for the MoE compute kernel, kept outside the timed
+    # region. Only the GEMMs carry tactics -- the a2a dispatch/combine ops have
+    # none -- so this tunes compute only and leaves the collective untouched.
+    # Mirrors routines/moe.py, which does the same for the standalone MoE path.
+    if getattr(args, "autotune", False):
+        assert enable_real_math, (
+            "--autotune requires --real_math; there is nothing to tune otherwise "
+            "(the a2a ops have no tactics)"
+        )
+        autotune_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        if rank == 0 and args.verbose >= 1:
+            print(f"[INFO] Autotuning MoE compute kernel: {autotune_iters} iters")
+        with autotune(True):
+            for _ in range(autotune_iters):
+                run_dispatch_combine(token_selected_experts, *input_payloads)
+        comm.Barrier()
+        torch.cuda.synchronize()
+
+    if getattr(args, "collective_timing", False):
+        # Collective-correct timing. bench_gpu_time is single-GPU oriented: it has
+        # no cross-rank barrier, so ranks drift and each sample mostly measures
+        # accumulated skew (observed: std 6x the median). Here every rank is
+        # aligned at the block boundary, CUDA events bracket the whole
+        # dispatch+compute+combine block with no fences inside it (so the phases
+        # keep whatever overlap they would have in production), and the per-block
+        # time is MAX-reduced -- the slowest rank is the real latency of a
+        # collective. Mirrors the convention already used for the mega kernel in
+        # moe_ep/kernel_src/cutedsl_megamoe/shim/autotune.py.
+        assert not enable_per_phase_timing, (
+            "--collective_timing times the whole block; --per_phase_timing inserts "
+            "fences inside it (and disables CUDA graphs). Pick one."
+        )
+        for _ in range(max(args.dry_run_iters, 1)):
+            run_dispatch_combine(token_selected_experts, *input_payloads)
+        torch.cuda.synchronize()
+
+        total_times = []
+        for _ in range(args.num_iters):
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            comm.Barrier()
+            torch.cuda.synchronize()
+            ev_start.record()
+            run_dispatch_combine(token_selected_experts, *input_payloads)
+            ev_end.record()
+            torch.cuda.synchronize()
+            total_times.append(
+                comm.allreduce(ev_start.elapsed_time(ev_end), op=MPI.MAX)
+            )
+    else:
+        # Use bench_gpu_time with cold L2 cache
+        total_times = bench_gpu_time(
+            fn=run_dispatch_combine,
+            input_args=(token_selected_experts, *input_payloads),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            # Note: disable use_cuda_graph when per_phase_timing=True, which inserts CUDA events in the middle
+            use_cuda_graph=(not args.no_cuda_graph and not enable_per_phase_timing),
+            cold_l2_cache=True,
+        )
 
     num_measure_iters = len(total_times)
 

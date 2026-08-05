@@ -120,6 +120,7 @@ def autotune_knobs(
     label: str,
     warmup_iters: int = 3,
     timed_iters: int = 10,
+    pre_warmup: Optional[Callable[[], None]] = None,
     on_winner: Optional[Callable[[Dict[str, Any], float], None]] = None,
 ) -> Dict[str, Any]:
     """Time each candidate on the live problem and apply the winner.
@@ -127,6 +128,15 @@ def autotune_knobs(
     ``frontend`` is a NVFP4/MXFP8 mega frontend (must have ``apply_knobs``);
     ``launch`` is a zero-arg closure that runs one synchronized forward with
     the caller's real staged inputs (e.g. a ``nvfp4_mega_moe(...)`` call).
+
+    ``pre_warmup`` (optional) is a zero-arg callable that triggers
+    ``cute.compile`` for the current candidate WITHOUT launching the GPU
+    kernel.  When provided it is called after ``apply_knobs`` + the first
+    collective barrier, followed by a second barrier to ensure every rank has
+    finished compilation before any rank launches the kernel.  This prevents
+    a class of deadlock where a fast-compiling rank launches the mega kernel
+    (which spin-waits on peer data via NVSHMEM) while a slow-compiling rank
+    is still in ``cute.compile`` and has not yet launched its kernel.
 
     ``on_winner`` (optional) is called once with ``(winner, p50_seconds)``
     after the winner is applied — used to persist the result in the knob
@@ -161,7 +171,14 @@ def autotune_knobs(
         try:
             frontend.apply_knobs(knobs)
             _barrier()
-            for _ in range(warmup_iters):  # first launch compiles
+            if pre_warmup is not None:
+                # Compile without launching so all ranks reach the kernel
+                # launch simultaneously.  The mega kernel spin-waits on
+                # NVSHMEM peer data; a rank that hasn't launched yet will
+                # never post that data, deadlocking peers that launched early.
+                pre_warmup()
+            _barrier()  # all ranks compiled; safe to launch collectively
+            for _ in range(warmup_iters):  # first launch compiles if no pre_warmup
                 launch()
             _barrier()
             iters: List[float] = []
@@ -223,7 +240,7 @@ def autotune_nvfp4_mega_moe(
     ``nvfp4_mega_moe`` calls on ``symm_buffer`` reuse the winning compile.
     COLLECTIVE -- see :func:`autotune_knobs`.
     """
-    from .nvfp4 import COMBINE_FORMAT_NAMES, nvfp4_mega_moe
+    from .nvfp4 import COMBINE_FORMAT_NAMES, MegaMoENvfp4Inputs, nvfp4_mega_moe
 
     def launch() -> None:
         # sync=True: the tune loop times launches with perf_counter, so the
@@ -238,6 +255,31 @@ def autotune_nvfp4_mega_moe(
             activation_clamp=activation_clamp,
             sync=True,
         )
+
+    fc1_weight, fc1_weight_sf = transformed_l1
+    fc2_weight, fc2_weight_sf = transformed_l2
+    _inputs_for_compile = MegaMoENvfp4Inputs(
+        activation=symm_buffer.x,
+        activation_sf=symm_buffer.x_sf,
+        topk_idx=symm_buffer.topk_idx,
+        topk_weights=symm_buffer.topk_weights,
+        fc1_weight=fc1_weight,
+        fc1_weight_sf=fc1_weight_sf,
+        fc2_weight=fc2_weight,
+        fc2_weight_sf=fc2_weight_sf,
+        fc1_alpha=symm_buffer.fc1_alpha,
+        fc2_alpha=symm_buffer.fc2_alpha,
+        fc1_norm_const=symm_buffer.fc1_norm_const,
+        output_activation=symm_buffer.output_activation,
+    )
+
+    def pre_warmup() -> None:
+        # Compile the candidate kernel without launching it.  All ranks must
+        # complete this before any rank calls launch(), because the mega kernel
+        # spin-waits on NVSHMEM peer data and deadlocks if a peer hasn't
+        # launched yet.  frontend.warmup() calls _ensure_mega_compiled()
+        # which triggers cute.compile but does not issue a kernel launch.
+        symm_buffer._frontend.warmup(_inputs_for_compile, num_tokens=num_tokens)
 
     cfg = symm_buffer._frontend.config
     if candidates is None:
@@ -275,6 +317,7 @@ def autotune_nvfp4_mega_moe(
         label="nvfp4_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        pre_warmup=pre_warmup,
         on_winner=_record,
     )
 

@@ -82,6 +82,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--quant", choices=["nvfp4", "bf16"], default="bf16")
     p.add_argument(
+        "--compute-backend",
+        choices=["auto", "trtllm", "cutedsl"],
+        default="auto",
+        help="nvfp4 compute kernel: auto tries CuteDSL then TrtLLM, trtllm forces TrtLLM-gen only",
+    )
+    p.add_argument(
         "--layout",
         choices=["expert_major", "rank_major"],
         default="expert_major",
@@ -172,11 +178,18 @@ def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, 
     canonical = MoEWeightPack(w13=w13, w2=w2)
 
     if args.quant == "nvfp4":
+        compute_backend = getattr(args, "compute_backend", "auto")
+        if compute_backend == "trtllm":
+            candidates = (TrtllmFp4Config(),)
+        elif compute_backend == "cutedsl":
+            candidates = (CuteDslConfig(),)
+        else:
+            candidates = (CuteDslConfig(), TrtllmFp4Config())
         cfg = MoEConfig(
             routing=routing,
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=experts,
-            backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+            backend=BackendOptions(candidates=candidates),
             execution=execution,
         )
     else:
