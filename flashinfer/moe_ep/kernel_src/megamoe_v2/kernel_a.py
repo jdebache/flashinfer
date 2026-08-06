@@ -13,28 +13,18 @@ Letting the weight TMA run early does not fix it either: it fills the four smem
 stages (~128 KB) and then backpressures, because the MMA cannot consume a
 weight tile without a token tile to multiply it by.
 
-So the mechanism has to be **per-expert readiness**.  The dispatch warps pull
-one expert's rows at a time, in order, and publish a row count as they go; the
-GEMM's TMA-B warp waits per tile on the expert that tile belongs to.  Expert 0's
-GEMM therefore runs while expert 1 is still being pulled, and from that point on
-the weight stream is limited by HBM rather than by the exchange.
+So the mechanism has to be **per-expert readiness**.  Each source publishes one
+expert's metadata at a time.  Its owner plans and pulls that expert immediately,
+then releases the matching GEMM work while later experts are still in flight.
 
 Warp layout (11 warps, 352 threads)::
 
     0-3  epilogue   4  MMA   5  TMA-A   6  TMA-B   7-10  dispatch
 
-Warps 7-10 run concurrently with 0-6 -- not before them.  The two groups meet
-at exactly two points: the schedule flag (the GEMM cannot decode tiles until
-``plan`` has written the prefix) and the per-expert row counters.
-
-What still serializes
----------------------
-
-The weight stream cannot begin until ``plan`` has run, because the tile decode
-needs the prefix, and ``plan`` needs the cross-rank barrier.  That is
-quantize + route + push + barrier of dead time at the head -- small next to the
-pull, but not zero.  Removing it needs the A-side walk order to be independent
-of the token counts, which is a schedule change, not a scheduling change.
+Warps 7-10 run concurrently with 0-6 -- not before them.  The weight side walks
+a static ``(expert, channel block)`` tile space, so it starts without a token
+prefix.  Token-block counts are runtime inner-loop bounds; every expert owns at
+least one padded block, letting TMA-A issue that first block unconditionally.
 """
 
 from __future__ import annotations
@@ -70,8 +60,6 @@ _ROW_VEC_WORDS = 4
     _PCOUNT,
     _PSLOT,
     _PWEIGHT,
-    _BSIG,
-    _BPHASE,
     _ECOUNT,
     _RANKOFF,
     _PREFIX,
@@ -84,10 +72,9 @@ _ROW_VEC_WORDS = 4
     _PEER,
     _GSYNC,
     _READY,
-    _SCHED,
     _NTOK,
     _RANK,
-) = range(28)
+) = range(25)
 
 
 @cute.jit
@@ -129,33 +116,32 @@ def grid_barrier(gsync: cute.Tensor, gen: Int32, tid: Int32, bar, *, num_blocks:
         else:
             while poll_i32(gsync.iterator + 1) != gen:
                 pass
+        cute.arch.fence_acq_rel_gpu()
     bar.arrive_and_wait()
     return gen + Int32(1)
 
 
 @cute.jit
-def wait_schedule(args) -> None:
-    """One thread per block: block until ``plan`` has published the prefix.
-
-    Only ``tidx == 0`` polls.  The caller releases the rest of the GEMM warps
-    through the named barrier that already precedes the prefix staging, so the
-    polling population is one thread per block rather than all seven warps of
-    every block -- which at a 152-block grid was ~34k threads hammering a
-    single address for the whole duration of the dispatch head.
-    """
-    while poll_i32(args[_SCHED].iterator + 0) == Int32(0):
+def wait_token_blocks(args, expert: Int32):
+    """Wait until ``expert`` has a published pool segment, then return it."""
+    prefix = args[_PREFIX]
+    while poll_i32(prefix.iterator + expert + Int32(1)) == Int32(0):
         pass
     cute.arch.fence_acq_rel_gpu()
+    first = prefix[expert]
+    return first, prefix[expert + Int32(1)] - first
 
 
 @cute.jit
-def wait_tokens(args, expert: Int32, *, tile_tokens: cutlass.Constexpr[int]) -> None:
+def wait_tokens(args, expert: Int32, *, tile_tokens: cutlass.Constexpr[int]):
     """TMA-B: block until every row of ``expert``'s pool segment has landed."""
-    prefix, ready = args[_PREFIX], args[_READY]
-    needed = (prefix[expert + Int32(1)] - prefix[expert]) * Int32(tile_tokens)
+    first, blocks = wait_token_blocks(args, expert)
+    ready = args[_READY]
+    needed = blocks * Int32(tile_tokens)
     while poll_i32(ready.iterator + expert) < needed:
         pass
     cute.arch.fence_acq_rel_gpu()
+    return first, blocks
 
 
 @cute.jit
@@ -220,9 +206,17 @@ def dispatch_prologue(
         pair += stride
     gen = grid_barrier(args[_GSYNC], gen, tid, bar, num_blocks=num_blocks)
 
-    # --- push each expert's run to its owner ---
+    # --- publish, plan, and pull one expert at a time ---
+    row_words: cutlass.Constexpr[int] = hidden // 8
     expert = flat_block
     while expert < Int32(num_experts):
+        # Blocks own a grid-stride sequence of experts.  A local ticket keeps
+        # publication in the same global-expert order on every source rank.
+        if tid == Int32(0):
+            while poll_i32(args[_GSYNC].iterator + 0) != expert:
+                pass
+        bar.arrive_and_wait()
+
         dst = expert // Int32(local_experts)
         le = expert % Int32(local_experts)
         off = args[_PEER][dst]
@@ -230,117 +224,127 @@ def dispatch_prologue(
         rs = peer_view(args[_PSLOT], off, args[_PSLOT].layout, cutlass.Int32)
         rw = peer_view(args[_PWEIGHT], off, args[_PWEIGHT].layout, cutlass.Float32)
         count = args[_SCOUNT][expert]
-        if tid == Int32(0):
-            rc[my_rank * Int32(local_experts) + le] = Int64(count)
         base = (le * Int32(world) + my_rank) * Int32(max_pairs)
         i = tid
         while i < count:
             rs[base + i] = args[_SSLOT][expert, i]
             rw[base + i] = args[_SWEIGHT][expert, i]
             i += Int32(threads)
-        expert += num_blocks
-    gen = grid_barrier(args[_GSYNC], gen, tid, bar, num_blocks=num_blocks)
-
-    # --- the one cross-rank wait, then the plan, on one block ---
-    if flat_block == Int32(0):
+        bar.arrive_and_wait()
         if tid == Int32(0):
-            phase = Int64(args[_BPHASE][0]) + Int64(1)
-            args[_BPHASE][0] = Int32(phase)
+            # Zero is the unpublished sentinel, so a real zero count travels
+            # as one.  The release fence covers the pair list above.
             cute.arch.fence_acq_rel_sys()
-            for r in cutlass.range_constexpr(world):
-                remote = peer_view(
-                    args[_BSIG],
-                    args[_PEER][r],
-                    args[_BSIG].layout,
-                    cutlass.Int64,
-                    align=8,
-                )
-                cute.arch.atomic_exch(remote.iterator + my_rank, phase)
-            for r in cutlass.range_constexpr(world):
-                seen = cute.arch.atomic_add(args[_BSIG].iterator + r, Int64(0))
-                while seen < phase:
-                    seen = cute.arch.atomic_add(args[_BSIG].iterator + r, Int64(0))
-            cute.arch.fence_acq_rel_sys()
+            cute.arch.atomic_exch(
+                rc.iterator + my_rank * Int32(local_experts) + le,
+                Int64(count) + Int64(1),
+            )
+            cute.arch.atomic_exch(args[_GSYNC].iterator + 0, expert + Int32(1))
+        bar.arrive_and_wait()
 
-            blocks = Int32(0)
-            args[_PREFIX][0] = Int32(0)
-            for le2 in cutlass.range_constexpr(local_experts):
+        if dst == my_rank:
+            if tid == Int32(0):
                 total = Int32(0)
                 for r in cutlass.range_constexpr(world):
-                    args[_RANKOFF][le2 * world + r] = total
-                    total += Int32(args[_PCOUNT][r * local_experts + le2])
-                args[_ECOUNT][le2] = Int64(total)
-                blocks += (total + Int32(tile_tokens - 1)) // Int32(tile_tokens)
-                args[_PREFIX][le2 + 1] = blocks
-            # Publishing the prefix releases every block's GEMM warps, which
-            # are spinning in wait_schedule; the weight stream starts here.
-            cute.arch.fence_acq_rel_gpu()
-            cute.arch.atomic_exch(args[_SCHED].iterator + 0, Int32(1))
-    gen = grid_barrier(args[_GSYNC], gen, tid, bar, num_blocks=num_blocks)
+                    slot = r * local_experts + le
+                    seen = cute.arch.atomic_add(args[_PCOUNT].iterator + slot, Int64(0))
+                    while seen == Int64(0):
+                        seen = cute.arch.atomic_add(
+                            args[_PCOUNT].iterator + slot, Int64(0)
+                        )
+                    args[_RANKOFF][le * world + r] = total
+                    total += Int32(seen - Int64(1))
+                cute.arch.fence_acq_rel_sys()
 
-    # --- pull, one expert at a time so readiness advances in expert order ---
-    row_words: cutlass.Constexpr[int] = hidden // 8
-    for le3 in cutlass.range_constexpr(local_experts):
-        base = args[_PREFIX][le3] * Int32(tile_tokens)
-        span = (args[_PREFIX][le3 + 1] - args[_PREFIX][le3]) * Int32(tile_tokens)
-        live = Int32(args[_ECOUNT][le3])
-        written = Int32(0)
+                # The preceding local expert owns this segment's base.  Each
+                # nonempty published prefix entry therefore doubles as its
+                # readiness flag.
+                if le > Int32(0):
+                    while poll_i32(args[_PREFIX].iterator + le) == Int32(0):
+                        pass
+                    cute.arch.fence_acq_rel_gpu()
+                args[_ECOUNT][le] = Int64(total)
+                blocks = (total + Int32(tile_tokens - 1)) // Int32(tile_tokens)
+                if blocks < Int32(1):
+                    blocks = Int32(1)
+                end = args[_PREFIX][le] + blocks
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.atomic_exch(args[_PREFIX].iterator + le + Int32(1), end)
+            bar.arrive_and_wait()
 
-        row = flat_block * Int32(DISPATCH_WARPS) + warp
-        while row < span:
-            if row < live:
-                # Find which source rank owns this row of the segment.
-                src = Int32(0)
-                for r in cutlass.range_constexpr(world - 1):
-                    nxt = args[_RANKOFF][le3 * world + r + 1]
-                    src += Int32(1) if nxt <= row else Int32(0)
-                i = row - args[_RANKOFF][le3 * world + src]
-                meta = (Int32(le3) * Int32(world) + src) * Int32(max_pairs) + i
-                packed = args[_PSLOT][meta]
-                token = packed // Int32(top_k)
-                off = args[_PEER][src]
-                rt = peer_view(
-                    args[_SEND_I32], off, args[_SEND_I32].layout, cutlass.Int32
-                )
-                rsf = peer_view(
-                    args[_SENDSF_I32], off, args[_SENDSF_I32].layout, cutlass.Int32
-                )
-                _copy_row(
-                    rt[token, None],
-                    args[_POOL_I32][base + row, None],
-                    lane,
-                    words=row_words,
-                )
-                for st in cutlass.range_constexpr((num_k_atoms + _WARP - 1) // _WARP):
-                    ka = lane + Int32(st * _WARP)
-                    if ka < Int32(num_k_atoms):
-                        args[_POOLSF_I32][
-                            sf_word_of(base + row, ka, num_k_atoms=num_k_atoms)
-                        ] = rsf[sf_word_of(token, ka, num_k_atoms=num_k_atoms)]
-                if lane == Int32(0):
-                    args[_POOLW][base + row] = args[_PWEIGHT][meta]
-                    args[_POOLSRC][base + row] = Int64(src) * Int64(
-                        max_tokens * top_k
-                    ) + Int64(packed)
-            else:
-                # Padding row: inert, not merely unread.  A stale E4M3 byte
-                # would read back as NaN and poison a whole 16-channel block.
-                if lane == Int32(0):
-                    args[_POOLW][base + row] = Float32(0.0)
-                    args[_POOLSRC][base + row] = Int64(-1)
-                for ka2 in cutlass.range_constexpr(num_k_atoms):
+            pool_base = args[_PREFIX][le] * Int32(tile_tokens)
+            span = (args[_PREFIX][le + Int32(1)] - args[_PREFIX][le]) * Int32(
+                tile_tokens
+            )
+            live = Int32(args[_ECOUNT][le])
+            row = warp
+            while row < span:
+                if row < live:
+                    src = Int32(0)
+                    for r in cutlass.range_constexpr(world - 1):
+                        nxt = args[_RANKOFF][le * world + r + 1]
+                        src += Int32(1) if nxt <= row else Int32(0)
+                    src_row = row - args[_RANKOFF][le * world + src]
+                    meta = (le * Int32(world) + src) * Int32(max_pairs) + src_row
+                    packed = args[_PSLOT][meta]
+                    token = packed // Int32(top_k)
+                    src_off = args[_PEER][src]
+                    rt = peer_view(
+                        args[_SEND_I32],
+                        src_off,
+                        args[_SEND_I32].layout,
+                        cutlass.Int32,
+                    )
+                    rsf = peer_view(
+                        args[_SENDSF_I32],
+                        src_off,
+                        args[_SENDSF_I32].layout,
+                        cutlass.Int32,
+                    )
+                    _copy_row(
+                        rt[token, None],
+                        args[_POOL_I32][pool_base + row, None],
+                        lane,
+                        words=row_words,
+                    )
+                    for st in cutlass.range_constexpr(
+                        (num_k_atoms + _WARP - 1) // _WARP
+                    ):
+                        ka = lane + Int32(st * _WARP)
+                        if ka < Int32(num_k_atoms):
+                            args[_POOLSF_I32][
+                                sf_word_of(
+                                    pool_base + row, ka, num_k_atoms=num_k_atoms
+                                )
+                            ] = rsf[sf_word_of(token, ka, num_k_atoms=num_k_atoms)]
                     if lane == Int32(0):
-                        args[_POOLSF_I32][
-                            sf_word_of(base + row, Int32(ka2), num_k_atoms=num_k_atoms)
-                        ] = Int32(0)
-            written += Int32(1)
-            row += num_blocks * Int32(DISPATCH_WARPS)
+                        args[_POOLW][pool_base + row] = args[_PWEIGHT][meta]
+                        args[_POOLSRC][pool_base + row] = Int64(src) * Int64(
+                            max_tokens * top_k
+                        ) + Int64(packed)
+                else:
+                    if lane == Int32(0):
+                        args[_POOLW][pool_base + row] = Float32(0.0)
+                        args[_POOLSRC][pool_base + row] = Int64(-1)
+                    for st2 in cutlass.range_constexpr(
+                        (num_k_atoms + _WARP - 1) // _WARP
+                    ):
+                        ka2 = lane + Int32(st2 * _WARP)
+                        if ka2 < Int32(num_k_atoms):
+                            args[_POOLSF_I32][
+                                sf_word_of(
+                                    pool_base + row, ka2, num_k_atoms=num_k_atoms
+                                )
+                            ] = Int32(0)
+                row += Int32(DISPATCH_WARPS)
 
-        # Publish this block's contribution.  The release fence is what makes
-        # the rows visible to the TMA that is about to fetch them.
-        if lane == Int32(0):
-            cute.arch.fence_acq_rel_gpu()
-            cute.arch.atomic_add(args[_READY].iterator + le3, written)
+            bar.arrive_and_wait()
+            if tid == Int32(0):
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.atomic_exch(args[_READY].iterator + le, span)
+            bar.arrive_and_wait()
+
+        expert += num_blocks
 
 
 @cute.jit
@@ -441,7 +445,7 @@ def launch_kernel_a(
             cluster_m=cluster_m,
             norm_const=norm_const,
         ),
-        wait_schedule=wait_schedule,
+        wait_token_blocks=wait_token_blocks,
         wait_tokens=functools.partial(wait_tokens, tile_tokens=tile_tokens),
         coop_args=coop_args,
     )

@@ -288,14 +288,15 @@ class KernelConfig:
         """Rows the local token pool must hold, worst case.
 
         Every token this rank receives occupies one pool row per (token,
-        expert) pair, and each expert's segment is padded up to a whole token
-        tile so tile decode never straddles two experts.  The bound assumes
-        the adversarial case where every peer sends every token here.
+        expert) pair.  Each expert also owns at least one whole token tile so
+        fused FC1 can issue its first weight tile before the count arrives.
+        The bound assumes the adversarial case where every peer sends every
+        token here.
         """
         pairs = self.shape.max_tokens_per_rank * self.topology.world_size
         pairs = min(pairs * self.shape.top_k, pairs * self.experts_per_rank)
-        padding = self.experts_per_rank * (self.tile.cluster_tile_tokens - 1)
-        return pairs + padding
+        min_segments = self.experts_per_rank * self.tile.cluster_tile_tokens
+        return pairs + min_segments
 
     def name(self) -> str:
         """Stable codegen cache key.

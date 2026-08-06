@@ -248,6 +248,7 @@ def _run_fused_pipeline(
     clamp=None,
     seed=5,
     num_clusters=8,
+    all_invalid=False,
 ):
     """Same problem, but as the two fused launches instead of nine staged ones."""
     import cuda.bindings.driver as cuda
@@ -296,6 +297,8 @@ def _run_fused_pipeline(
     logits = torch.rand(num_tokens, num_experts, device="cuda", generator=g) ** 3
     topk_ids = logits.topk(top_k, dim=-1).indices.to(torch.int32)
     topk_ids[::9, -1] = -1
+    if all_invalid:
+        topk_ids.fill_(-1)
     topk_weights = torch.rand(
         num_tokens, top_k, dtype=torch.float32, device="cuda", generator=g
     )
@@ -360,6 +363,36 @@ def test_fused_pipeline_with_clamp():
         clamp=2.0,
     )
     _assert_matches(got, expected)
+
+
+def test_fused_all_slots_invalid():
+    _require_blackwell()
+    got, expected, pipe, _ = _run_fused_pipeline(
+        num_tokens=64,
+        hidden=512,
+        intermediate=256,
+        num_experts=4,
+        top_k=1,
+        all_invalid=True,
+    )
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
+    assert got.abs().max() == 0.0
+    assert tuple(int(v) for v in pipe.views.peer_expert_count) == (1, 1, 1, 1)
+
+
+def test_fused_rerun_is_idempotent():
+    _require_blackwell()
+    got, expected, pipe, _ = _run_fused_pipeline(
+        num_tokens=256,
+        hidden=512,
+        intermediate=256,
+        num_experts=4,
+        top_k=2,
+    )
+    _assert_matches(got, expected)
+    launcher.run_fused(pipe)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(pipe.out.float(), got, atol=0, rtol=0)
 
 
 def test_fused_rejects_non_resident_grid():

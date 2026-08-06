@@ -135,7 +135,9 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
             # Per (source rank, local expert) token count, pushed by the
             # *source* rank into its own row of the destination's array.  Each
             # source owns one row, so no rank ever needs a remote atomic to
-            # find where to write.
+            # find where to write.  Staged dispatch stores the raw count behind
+            # a global barrier; fused dispatch stores count + 1 so zero is an
+            # unpublished sentinel for its per-expert rendezvous.
             Region(
                 "peer_expert_count",
                 world * local_experts * _BYTES_I64,
@@ -204,7 +206,6 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
 def local_layout(config: KernelConfig) -> WorkspaceLayout:
     """Rank-private regions, including the whole A -> B handoff."""
     shape = config.shape
-    tile = config.tile
     local_experts = config.experts_per_rank
     pool_rows = config.pool_token_capacity
     pool_sf_rows = sf_row_capacity(pool_rows)
@@ -216,18 +217,10 @@ def local_layout(config: KernelConfig) -> WorkspaceLayout:
 
     return _resolve(
         (
-            # Token tiles whose rows have all landed, per expert-tile slot.
-            # Kernel A's dispatch warps increment; kernel A's FC1 B-side waits.
+            # Padded rows that have landed, per local expert.  Kernel A's owner
+            # CTA publishes the full segment; FC1's TMA-B warp waits on it.
             Region(
                 "token_ready_count",
-                (pool_rows // tile.cluster_tile_tokens + local_experts + 1)
-                * _BYTES_I32,
-                _ALIGN_COUNTER,
-                resettable=True,
-            ),
-            # Per (local expert) running slot allocator used while pulling.
-            Region(
-                "expert_fill_cursor",
                 local_experts * _BYTES_I32,
                 _ALIGN_COUNTER,
                 resettable=True,
@@ -237,9 +230,6 @@ def local_layout(config: KernelConfig) -> WorkspaceLayout:
             # to reason about the other's leftover generation number.
             Region("grid_sync", 2 * _BYTES_I32, _ALIGN_COUNTER, resettable=True),
             Region("grid_sync_b", 2 * _BYTES_I32, _ALIGN_COUNTER, resettable=True),
-            # Set once by kernel A's plan step; the GEMM warps spin on it
-            # before they may decode a single tile.
-            Region("schedule_flag", _BYTES_I32, _ALIGN_COUNTER, resettable=True),
             # Routing staging, indexed by *global* expert: how many local pairs
             # go to each, and which.  Staged rather than written straight to
             # the destination because the slot index comes from a local atomic,
@@ -260,6 +250,7 @@ def local_layout(config: KernelConfig) -> WorkspaceLayout:
             ),
             # Exclusive prefix of per-expert token tiles: the schedule itself,
             # computed on device because the counts are only known there.
+            # Fused dispatch advances it by at least one tile per expert.
             Region(
                 "token_block_prefix",
                 (local_experts + 1) * _BYTES_I32,

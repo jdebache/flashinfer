@@ -165,7 +165,6 @@ class Views:
     fc1_out_sf: torch.Tensor
     grid_sync: torch.Tensor
     grid_sync_b: torch.Tensor
-    schedule_flag: torch.Tensor
     token_ready: torch.Tensor
 
 
@@ -240,7 +239,6 @@ def build_views(ws: Workspaces, config: KernelConfig) -> Views:
         ).view(torch.float8_e4m3fn),
         grid_sync=region(lo, ll, "grid_sync", _I32, (2,)),
         grid_sync_b=region(lo, ll, "grid_sync_b", _I32, (2,)),
-        schedule_flag=region(lo, ll, "schedule_flag", _I32, (1,)),
         # The readiness counters live in the first `local_experts` slots of the
         # token-tile readiness region.
         token_ready=region(lo, ll, "token_ready_count", _I32, (le,)),
@@ -569,8 +567,6 @@ def compile_fused(
         mk(v.peer_expert_count),
         mk(v.src_token_slot),
         mk(v.src_topk_weight),
-        mk(v.barrier_signal),
-        mk(v.barrier_phase),
         mk(v.expert_token_count),
         mk(v.rank_pool_offset),
         mk(v.token_block_prefix),
@@ -583,7 +579,6 @@ def compile_fused(
         mk(ws.peer_offset),
         mk(v.grid_sync),
         mk(v.token_ready),
-        mk(v.schedule_flag),
         scalar(activation.shape[0]),
         scalar(rank),
     )

@@ -265,6 +265,24 @@ def test_pool_holds_the_worst_case_dispatch(shape):
         )
 
 
+def test_pool_holds_minimum_tiles_for_empty_experts():
+    shape = ProblemShape(
+        hidden=512,
+        intermediate=256,
+        num_experts=4,
+        top_k=1,
+        max_tokens_per_rank=129,
+    )
+    cfg = _config(shape, Phase.FC1, world_size=1)
+    counts = (129, 0, 0, 0)
+    needed = sum(
+        max(1, ceil_div(count, cfg.tile.cluster_tile_tokens))
+        * cfg.tile.cluster_tile_tokens
+        for count in counts
+    )
+    assert needed <= cfg.pool_token_capacity
+
+
 def _worst_case_counts(total_pairs: int, num_experts: int) -> tuple[int, ...]:
     """Spread that maximises padding waste: each expert one token over a tile."""
     per = total_pairs // num_experts

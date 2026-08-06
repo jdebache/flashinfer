@@ -109,6 +109,14 @@ def decode_tile_device(
 
 
 @cute.jit
+def decode_static_tile_device(
+    tile_index: Int32, *, channel_blocks: cutlass.Constexpr[int]
+):
+    """Decode the fused FC1 outer tile, independent of token counts."""
+    return tile_index // Int32(channel_blocks), tile_index % Int32(channel_blocks)
+
+
+@cute.jit
 def epilogue_plain(
     tTR_accs,  # one TMEM-partitioned accumulator per acc stage
     tiled_t2r,
@@ -191,7 +199,7 @@ def _grouped_gemm_kernel(
     use_pdl: cutlass.Constexpr[bool],
     dispatch_warps: cutlass.Constexpr[int],
     prologue: cutlass.Constexpr,
-    wait_schedule: cutlass.Constexpr,
+    wait_token_blocks: cutlass.Constexpr,
     wait_tokens: cutlass.Constexpr,
     finalize: cutlass.Constexpr,
     coop_args,
@@ -320,29 +328,23 @@ def _grouped_gemm_kernel(
         if warp_idx >= Int32(_NUM_WARPS):
             prologue(coop_args, tidx - Int32(_NUM_WARPS * 32), bidx, bidz, gdim_z)
 
-    # The prefix is staged by the GEMM warps only, and after the split, because
-    # when dispatch is fused it does not exist until the prologue's plan step.
-    if warp_idx < Int32(_NUM_WARPS):
-        prefix_bar = pipeline.NamedBarrier(
-            barrier_id=_PREFIX_BARRIER, num_threads=32 * _NUM_WARPS
-        )
-        if cutlass.const_expr(dispatch_warps > 0):
-            # One poller, then a rendezvous: the other GEMM warps have nothing
-            # to do until the prefix exists, and spinning alongside the poller
-            # only steals memory bandwidth from the dispatch warps producing it.
-            if tidx == Int32(0):
-                wait_schedule(coop_args)
+    # Standalone GEMMs consume a complete prefix.  Fused FC1 instead reads
+    # incrementally published entries from GMEM and never gates weight issue on
+    # a global schedule.
+    if cutlass.const_expr(dispatch_warps == 0):
+        if warp_idx < Int32(_NUM_WARPS):
+            prefix_bar = pipeline.NamedBarrier(
+                barrier_id=_PREFIX_BARRIER, num_threads=32 * _NUM_WARPS
+            )
+            if tidx < Int32(num_experts + 1):
+                prefix[tidx] = prefix_gmem[tidx]
             prefix_bar.arrive_and_wait()
-        if tidx < Int32(num_experts + 1):
-            prefix[tidx] = prefix_gmem[tidx]
-        prefix_bar.arrive_and_wait()
 
-    # The tile count is derived, not passed: the per-expert counts only
-    # exist on device once dispatch has run, and `prefix[num_experts]` is
-    # already the total token-block count.  Deriving it here keeps one
-    # source of truth -- a host-side copy could disagree with the prefix
-    # the warps actually walk.
-    total_tiles = prefix[num_experts] * Int32(channel_blocks)
+    if cutlass.const_expr(dispatch_warps > 0):
+        total_tiles = Int32(num_experts * channel_blocks)
+    else:
+        # The complete prefix is the source of truth for standalone GEMMs.
+        total_tiles = prefix[num_experts] * Int32(channel_blocks)
 
     tile_tokens: cutlass.Constexpr[int] = mma_tiler[1]
     # One cluster = one persistent worker.  Static striding needs no atomics
@@ -371,13 +373,18 @@ def _grouped_gemm_kernel(
 
         tile = cluster_id
         while tile < total_tiles:
-            expert, ch_block, _tb, _first = decode_tile_device(
-                tile,
-                prefix,
-                num_experts=num_experts,
-                channel_blocks=channel_blocks,
-                tile_tokens=tile_tokens,
-            )
+            if cutlass.const_expr(dispatch_warps > 0):
+                expert, ch_block = decode_static_tile_device(
+                    tile, channel_blocks=channel_blocks
+                )
+            else:
+                expert, ch_block, _tb, _first = decode_tile_device(
+                    tile,
+                    prefix,
+                    num_experts=num_experts,
+                    channel_blocks=channel_blocks,
+                    tile_tokens=tile_tokens,
+                )
             gA = cute.local_tile(
                 a_view, cute.slice_(mma_tiler, (None, 0, None)), (None, None, None)
             )
@@ -416,6 +423,30 @@ def _grouped_gemm_kernel(
                 data_mask=a_mask,
                 sf_mask=sfa_mask,
             )
+            if cutlass.const_expr(dispatch_warps > 0):
+                # The first token block exists even for an empty expert.  Issue
+                # it before consulting the incremental prefix; the pipeline
+                # then backpressures naturally until TMA-B has real tokens.
+                _first_tb, token_blocks = wait_token_blocks(coop_args, expert)
+                token_block = Int32(1)
+                while token_block < token_blocks:
+                    producer = _stream_a(
+                        a_atom,
+                        sfa_atom,
+                        tAgA,
+                        tAgSFA,
+                        tAsA,
+                        tAsSFA,
+                        producer,
+                        ch_block,
+                        expert,
+                        k_tiles=k_tiles,
+                        acc_stages=acc_stages,
+                        channel_blocks=channel_blocks,
+                        data_mask=a_mask,
+                        sf_mask=sfa_mask,
+                    )
+                    token_block += Int32(1)
             tile += num_clusters
         producer.tail()
 
@@ -453,22 +484,22 @@ def _grouped_gemm_kernel(
 
         tile = cluster_id
         while tile < total_tiles:
-            expert_b, _ch, token_block, first_tb = decode_tile_device(
-                tile,
-                prefix,
-                num_experts=num_experts,
-                channel_blocks=channel_blocks,
-                tile_tokens=tile_tokens,
-            )
-            # Per expert, not per kernel: expert 0's rows land long before the
-            # last expert's, and waiting on the whole pool would idle the MMA
-            # -- which would in turn backpressure the weight stream after four
-            # smem stages and undo the overlap entirely.
             if cutlass.const_expr(dispatch_warps > 0):
-                wait_tokens(coop_args, expert_b)
-            # The pool is one flat matrix; an expert's segment start is just
-            # its prefix, so the absolute token tile is prefix + local index.
-            abs_tb = first_tb + token_block
+                expert_b, _ch = decode_static_tile_device(
+                    tile, channel_blocks=channel_blocks
+                )
+                # Per expert, not per kernel: expert 0's rows land while later
+                # metadata and rows are still moving.
+                first_tb, token_blocks = wait_tokens(coop_args, expert_b)
+                token_block = Int32(0)
+            else:
+                expert_b, _ch, token_block, first_tb = decode_tile_device(
+                    tile,
+                    prefix,
+                    num_experts=num_experts,
+                    channel_blocks=channel_blocks,
+                    tile_tokens=tile_tokens,
+                )
             gB = cute.local_tile(
                 b_view, cute.slice_(mma_tiler, (0, None, None)), (None, None, None)
             )
@@ -491,18 +522,37 @@ def _grouped_gemm_kernel(
             )
             tBsSFB = cute.filter_zeros(tBsSFB)
             tBgSFB = cute.filter_zeros(tBgSFB)
-            producer = _stream(
-                b_atom,
-                sfb_atom,
-                tBgB[(None, abs_tb, None, 0)],
-                tBgSFB[(None, abs_tb, None, 0)],
-                tBsB,
-                tBsSFB,
-                producer,
-                k_tiles=k_tiles,
-                data_mask=b_mask,
-                sf_mask=sfb_mask,
-            )
+            if cutlass.const_expr(dispatch_warps > 0):
+                stop_tb = token_block + token_blocks
+                while token_block < stop_tb:
+                    abs_tb = first_tb + token_block
+                    producer = _stream(
+                        b_atom,
+                        sfb_atom,
+                        tBgB[(None, abs_tb, None, 0)],
+                        tBgSFB[(None, abs_tb, None, 0)],
+                        tBsB,
+                        tBsSFB,
+                        producer,
+                        k_tiles=k_tiles,
+                        data_mask=b_mask,
+                        sf_mask=sfb_mask,
+                    )
+                    token_block += Int32(1)
+            else:
+                abs_tb = first_tb + token_block
+                producer = _stream(
+                    b_atom,
+                    sfb_atom,
+                    tBgB[(None, abs_tb, None, 0)],
+                    tBgSFB[(None, abs_tb, None, 0)],
+                    tBsB,
+                    tBsSFB,
+                    producer,
+                    k_tiles=k_tiles,
+                    data_mask=b_mask,
+                    sf_mask=sfb_mask,
+                )
             tile += num_clusters
         producer.tail()
 
@@ -554,63 +604,69 @@ def _grouped_gemm_kernel(
         if is_leader:
             tile = cluster_id
             while tile < total_tiles:
-                # One barrier guards every accumulator of the tile: the
-                # epilogue needs them together (SwiGLU pairs them), so a
-                # per-range stage would buy nothing and cost a second mbarrier.
-                acc_pipe.producer_acquire(acc_prod)
-                mma_a.set(tcgen05.Field.ACCUMULATE, False)
-                if cutlass.const_expr(acc_stages > 1):
-                    mma_b.set(tcgen05.Field.ACCUMULATE, False)
-                for _ in cutlass.range(k_tiles, unroll=1):
-                    b_pipe.consumer_wait(b_cons)
-                    cute.copy(
-                        s2t_sfb,
-                        sSFB_s2t[(None, None, None, None, b_cons.index)],
-                        tSFB_s2t,
+                if cutlass.const_expr(dispatch_warps > 0):
+                    expert_mma, _ch = decode_static_tile_device(
+                        tile, channel_blocks=channel_blocks
                     )
-                    # Ranges consume back to back against this one B stage,
-                    # which is why TMA-B fetches each token tile once even
-                    # though the tile computes `acc_stages` of them.
-                    for j in cutlass.range_constexpr(acc_stages):
-                        a_pipe.consumer_wait(a_cons)
-                        cute.copy(
-                            s2t_sfa,
-                            sSFA_s2t[(None, None, None, None, a_cons.index)],
-                            tSFA_s2t,
-                        )
-                        # Each range's descriptor must be reached through a
-                        # plain named local, not a tuple element: the DSL's
-                        # loop-carry analysis follows assignments to names, and
-                        # a value mutated only via `mmas[j]` is yielded from a
-                        # region it was not defined in.
-                        if cutlass.const_expr(j == 0):
-                            mma_a = _issue_range(
+                    _first_tb, token_blocks = wait_token_blocks(
+                        coop_args, expert_mma
+                    )
+                    token_block = Int32(0)
+                    while token_block < token_blocks:
+                        acc_pipe.producer_acquire(acc_prod)
+                        mma_a.set(tcgen05.Field.ACCUMULATE, False)
+                        if cutlass.const_expr(acc_stages > 1):
+                            mma_b.set(tcgen05.Field.ACCUMULATE, False)
+                        for _ in cutlass.range(k_tiles, unroll=1):
+                            mma_a, mma_b, a_cons, b_cons = _consume_mma_k_tile(
                                 mma_a,
-                                tAccs[0],
-                                tCrA,
-                                tCrB,
-                                tSFA,
-                                tSFB,
-                                a_cons.index,
-                                b_cons.index,
-                            )
-                        else:
-                            mma_b = _issue_range(
                                 mma_b,
-                                tAccs[1],
+                                tAccs,
+                                b_pipe,
+                                b_cons,
+                                s2t_sfb,
+                                sSFB_s2t,
+                                tSFB_s2t,
+                                a_pipe,
+                                a_cons,
+                                s2t_sfa,
+                                sSFA_s2t,
+                                tSFA_s2t,
                                 tCrA,
                                 tCrB,
                                 tSFA,
                                 tSFB,
-                                a_cons.index,
-                                b_cons.index,
                             )
-                        a_pipe.consumer_release(a_cons)
-                        a_cons.advance()
-                    b_pipe.consumer_release(b_cons)
-                    b_cons.advance()
-                acc_pipe.producer_commit(acc_prod)
-                acc_prod.advance()
+                        acc_pipe.producer_commit(acc_prod)
+                        acc_prod.advance()
+                        token_block += Int32(1)
+                else:
+                    acc_pipe.producer_acquire(acc_prod)
+                    mma_a.set(tcgen05.Field.ACCUMULATE, False)
+                    if cutlass.const_expr(acc_stages > 1):
+                        mma_b.set(tcgen05.Field.ACCUMULATE, False)
+                    for _ in cutlass.range(k_tiles, unroll=1):
+                        mma_a, mma_b, a_cons, b_cons = _consume_mma_k_tile(
+                            mma_a,
+                            mma_b,
+                            tAccs,
+                            b_pipe,
+                            b_cons,
+                            s2t_sfb,
+                            sSFB_s2t,
+                            tSFB_s2t,
+                            a_pipe,
+                            a_cons,
+                            s2t_sfa,
+                            sSFA_s2t,
+                            tSFA_s2t,
+                            tCrA,
+                            tCrB,
+                            tSFA,
+                            tSFB,
+                        )
+                    acc_pipe.producer_commit(acc_prod)
+                    acc_prod.advance()
                 tile += num_clusters
 
     # ---------------- epilogue ----------------
@@ -649,34 +705,67 @@ def _grouped_gemm_kernel(
 
         tile = cluster_id
         while tile < total_tiles:
-            _e, ch_block, token_block, first_tb = decode_tile_device(
-                tile,
-                prefix,
-                num_experts=num_experts,
-                channel_blocks=channel_blocks,
-                tile_tokens=tile_tokens,
-            )
-            abs_tb = first_tb + token_block
-            acc_pipe.consumer_wait(acc_cons)
-            epilogue(
-                tTR_accs,
-                tiled_t2r,
-                thr_t2r,
-                ch_block,
-                abs_tb,
-                mma_v,
-                tidx,
-                epi_args,
-                stage_smem,
-                acc_stages=acc_stages,
-                channel_blocks=channel_blocks,
-                cta_tile_m=cta_tile_m,
-                tile_tokens=tile_tokens,
-                epi_n=epi_n,
-                cta_per_mma=cta_per_mma,
-            )
-            acc_pipe.consumer_release(acc_cons)
-            acc_cons.advance()
+            if cutlass.const_expr(dispatch_warps > 0):
+                expert_epi, ch_block = decode_static_tile_device(
+                    tile, channel_blocks=channel_blocks
+                )
+                first_tb, token_blocks = wait_token_blocks(coop_args, expert_epi)
+                token_block = Int32(0)
+            else:
+                _e, ch_block, token_block, first_tb = decode_tile_device(
+                    tile,
+                    prefix,
+                    num_experts=num_experts,
+                    channel_blocks=channel_blocks,
+                    tile_tokens=tile_tokens,
+                )
+            if cutlass.const_expr(dispatch_warps > 0):
+                stop_tb = token_block + token_blocks
+                while token_block < stop_tb:
+                    abs_tb = first_tb + token_block
+                    acc_pipe.consumer_wait(acc_cons)
+                    epilogue(
+                        tTR_accs,
+                        tiled_t2r,
+                        thr_t2r,
+                        ch_block,
+                        abs_tb,
+                        mma_v,
+                        tidx,
+                        epi_args,
+                        stage_smem,
+                        acc_stages=acc_stages,
+                        channel_blocks=channel_blocks,
+                        cta_tile_m=cta_tile_m,
+                        tile_tokens=tile_tokens,
+                        epi_n=epi_n,
+                        cta_per_mma=cta_per_mma,
+                    )
+                    acc_pipe.consumer_release(acc_cons)
+                    acc_cons.advance()
+                    token_block += Int32(1)
+            else:
+                abs_tb = first_tb + token_block
+                acc_pipe.consumer_wait(acc_cons)
+                epilogue(
+                    tTR_accs,
+                    tiled_t2r,
+                    thr_t2r,
+                    ch_block,
+                    abs_tb,
+                    mma_v,
+                    tidx,
+                    epi_args,
+                    stage_smem,
+                    acc_stages=acc_stages,
+                    channel_blocks=channel_blocks,
+                    cta_tile_m=cta_tile_m,
+                    tile_tokens=tile_tokens,
+                    epi_n=epi_n,
+                    cta_per_mma=cta_per_mma,
+                )
+                acc_pipe.consumer_release(acc_cons)
+                acc_cons.advance()
             tile += num_clusters
 
         # Rendezvous the epilogue warps only -- a plain block barrier here
@@ -699,6 +788,68 @@ def _grouped_gemm_kernel(
         if cutlass.const_expr(use_pdl):
             cute.arch.fence_acq_rel_gpu()
             cute.arch.griddepcontrol_launch_dependents()
+
+
+def _consume_mma_k_tile(
+    mma_a,
+    mma_b,
+    tAccs,
+    b_pipe,
+    b_cons,
+    s2t_sfb,
+    sSFB_s2t,
+    tSFB_s2t,
+    a_pipe,
+    a_cons,
+    s2t_sfa,
+    sSFA_s2t,
+    tSFA_s2t,
+    tCrA,
+    tCrB,
+    tSFA,
+    tSFB,
+):
+    """Consume one K tile, inlined so descriptor mutations stay loop-local."""
+    b_pipe.consumer_wait(b_cons)
+    cute.copy(
+        s2t_sfb,
+        sSFB_s2t[(None, None, None, None, b_cons.index)],
+        tSFB_s2t,
+    )
+    for j in range(len(tAccs)):
+        a_pipe.consumer_wait(a_cons)
+        cute.copy(
+            s2t_sfa,
+            sSFA_s2t[(None, None, None, None, a_cons.index)],
+            tSFA_s2t,
+        )
+        if j == 0:
+            mma_a = _issue_range(
+                mma_a,
+                tAccs[0],
+                tCrA,
+                tCrB,
+                tSFA,
+                tSFB,
+                a_cons.index,
+                b_cons.index,
+            )
+        else:
+            mma_b = _issue_range(
+                mma_b,
+                tAccs[1],
+                tCrA,
+                tCrB,
+                tSFA,
+                tSFB,
+                a_cons.index,
+                b_cons.index,
+            )
+        a_pipe.consumer_release(a_cons)
+        a_cons.advance()
+    b_pipe.consumer_release(b_cons)
+    b_cons.advance()
+    return mma_a, mma_b, a_cons, b_cons
 
 
 def _issue_range(mma, tAcc, tCrA, tCrB, tSFA, tSFB, a_index, b_index):
@@ -868,7 +1019,7 @@ def launch_grouped_gemm(
     use_pdl: cutlass.Constexpr[bool] = False,
     dispatch_warps: cutlass.Constexpr[int] = 0,
     prologue: cutlass.Constexpr = None,
-    wait_schedule: cutlass.Constexpr = None,
+    wait_token_blocks: cutlass.Constexpr = None,
     wait_tokens: cutlass.Constexpr = None,
     finalize: cutlass.Constexpr = None,
     coop_args=(),
@@ -1042,7 +1193,7 @@ def launch_grouped_gemm(
         use_pdl,
         dispatch_warps,
         prologue,
-        wait_schedule,
+        wait_token_blocks,
         wait_tokens,
         finalize,
         coop_args,

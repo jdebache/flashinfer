@@ -4,9 +4,9 @@
 
 The staged pipeline already validates the same arithmetic, so what is new here
 is the concurrency: dispatch warps and GEMM warps running at once, meeting only
-at the schedule flag and the per-expert row counters.  The reference is the
-staged path's own FC1 output, so any difference is a fusion bug rather than a
-numerics one.
+at incrementally published per-expert prefixes and row counters.  The reference
+is the staged path's own FC1 output, so any difference is a fusion bug rather
+than a numerics one.
 
 Failures here tend to be hangs, not wrong answers -- a grid barrier that not
 every block reaches, or a readiness counter that never hits its target.
@@ -83,6 +83,8 @@ def _run_fused(
     clamp=None,
     seed=5,
     num_clusters=4,
+    empty_expert=None,
+    all_invalid=False,
 ):
     import cutlass.cute as cute
     import cutlass.torch as ct
@@ -100,6 +102,10 @@ def _run_fused(
     act, w1, topk_ids, topk_weights = _build(
         num_tokens, hidden, intermediate, num_experts, top_k, seed
     )
+    if empty_expert is not None:
+        topk_ids[topk_ids == empty_expert] = 0
+    if all_invalid:
+        topk_ids.fill_(-1)
     qw1 = quantize_nvfp4(w1.reshape(-1, hidden))
 
     send_b = _z(num_tokens, hidden // 2, dtype=torch.uint8)
@@ -122,6 +128,8 @@ def _run_fused(
     ntok = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
     prefix = _z(le + 1)
     ready = _z(le)
+    pool_src = _z(pool_rows, dtype=torch.int64)
+    peer_count = _z(world * le, dtype=torch.int64)
     coop = (
         mk(act),
         mk(topk_ids),
@@ -131,11 +139,9 @@ def _run_fused(
         mk(_z(num_experts)),
         mk(_z(num_experts, max_pairs)),
         mk(_z(num_experts, max_pairs, dtype=torch.float32)),
-        mk(_z(world * le, dtype=torch.int64)),
+        mk(peer_count),
         mk(_z(le * world * max_pairs)),
         mk(_z(le * world * max_pairs, dtype=torch.float32)),
-        mk(_z(world, dtype=torch.int64)),
-        mk(_z(1)),
         mk(_z(le, dtype=torch.int64)),
         mk(_z(le * world)),
         mk(prefix),
@@ -144,11 +150,10 @@ def _run_fused(
         mk(pool_b.view(torch.int32)),
         mk(pool_sf_b.view(torch.int32)),
         mk(_z(pool_rows, dtype=torch.float32)),
-        mk(_z(pool_rows, dtype=torch.int64)),
+        mk(pool_src),
         mk(_z(world, dtype=torch.int64)),
         mk(_z(2)),
         mk(ready),
-        mk(_z(1)),
         mk(ntok),
         mk(torch.tensor([0], dtype=torch.int32, device="cuda")),
     )
@@ -183,6 +188,8 @@ def _run_fused(
         prefix=prefix,
         ready=ready,
         topk_ids=topk_ids,
+        pool_src=pool_src,
+        peer_count=peer_count,
         pool_rows=pool_rows,
     )
 
@@ -195,10 +202,44 @@ def test_kernel_a_runs_and_schedules():
     blocks = 0
     for e, c in enumerate(counts):
         assert int(r["prefix"][e]) == blocks
-        blocks += (c + _TILE - 1) // _TILE
+        blocks += max(1, (c + _TILE - 1) // _TILE)
     assert int(r["prefix"][2]) == blocks
     # Every expert's rows were published exactly once.
     for e in range(2):
         want = (int(r["prefix"][e + 1]) - int(r["prefix"][e])) * _TILE
         assert int(r["ready"][e]) == want
     assert r["fc1"].any(), "FC1 produced nothing"
+
+
+def test_kernel_a_pads_an_empty_expert():
+    """An empty expert still has one inert tile with no scatter destination."""
+    _require_blackwell()
+    r = _run_fused(
+        num_tokens=64,
+        hidden=512,
+        intermediate=256,
+        num_experts=2,
+        top_k=1,
+        empty_expert=1,
+    )
+    assert tuple(int(v) for v in r["prefix"]) == (0, 1, 2)
+    assert tuple(int(v) for v in r["ready"]) == (_TILE, _TILE)
+    counts = tuple(int((r["topk_ids"] == e).sum()) for e in range(2))
+    assert tuple(int(v) for v in r["peer_count"]) == tuple(c + 1 for c in counts)
+    assert (r["pool_src"][_TILE : 2 * _TILE] == -1).all()
+
+
+def test_kernel_a_publishes_all_empty_experts():
+    _require_blackwell()
+    r = _run_fused(
+        num_tokens=32,
+        hidden=512,
+        intermediate=256,
+        num_experts=2,
+        top_k=1,
+        all_invalid=True,
+    )
+    assert tuple(int(v) for v in r["peer_count"]) == (1, 1)
+    assert tuple(int(v) for v in r["prefix"]) == (0, 1, 2)
+    assert tuple(int(v) for v in r["ready"]) == (_TILE, _TILE)
+    assert (r["pool_src"][: 2 * _TILE] == -1).all()
