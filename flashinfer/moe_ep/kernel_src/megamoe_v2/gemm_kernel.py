@@ -193,6 +193,7 @@ def _grouped_gemm_kernel(
     prologue: cutlass.Constexpr,
     wait_schedule: cutlass.Constexpr,
     wait_tokens: cutlass.Constexpr,
+    finalize: cutlass.Constexpr,
     coop_args,
 ):
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -322,13 +323,19 @@ def _grouped_gemm_kernel(
     # The prefix is staged by the GEMM warps only, and after the split, because
     # when dispatch is fused it does not exist until the prologue's plan step.
     if warp_idx < Int32(_NUM_WARPS):
+        prefix_bar = pipeline.NamedBarrier(
+            barrier_id=_PREFIX_BARRIER, num_threads=32 * _NUM_WARPS
+        )
         if cutlass.const_expr(dispatch_warps > 0):
-            wait_schedule(coop_args)
+            # One poller, then a rendezvous: the other GEMM warps have nothing
+            # to do until the prefix exists, and spinning alongside the poller
+            # only steals memory bandwidth from the dispatch warps producing it.
+            if tidx == Int32(0):
+                wait_schedule(coop_args)
+            prefix_bar.arrive_and_wait()
         if tidx < Int32(num_experts + 1):
             prefix[tidx] = prefix_gmem[tidx]
-        pipeline.NamedBarrier(
-            barrier_id=_PREFIX_BARRIER, num_threads=32 * _NUM_WARPS
-        ).arrive_and_wait()
+        prefix_bar.arrive_and_wait()
 
     # The tile count is derived, not passed: the per-expert counts only
     # exist on device once dispatch has run, and `prefix[num_experts]` is
@@ -679,6 +686,13 @@ def _grouped_gemm_kernel(
         ).arrive_and_wait()
         tmem.free(acc_ptr, _TMEM_CAPACITY_COLS)
 
+        # Post-loop work, on the epilogue warps: they are the ones that just
+        # did the stores, and they are already rendezvoused.  Kernel B uses
+        # this for the cross-rank barrier and the combine reduction, which is
+        # what lets FC2 + combine + reduce be a single launch.
+        if cutlass.const_expr(finalize is not None):
+            finalize(coop_args, tidx, bidx, bidz, gdim_z)
+
         # Release this block's output before telling the dependent grid it may
         # start.  The fence is not optional: the trigger orders *launch*, and
         # the successor only sees these stores if they are released first.
@@ -856,6 +870,7 @@ def launch_grouped_gemm(
     prologue: cutlass.Constexpr = None,
     wait_schedule: cutlass.Constexpr = None,
     wait_tokens: cutlass.Constexpr = None,
+    finalize: cutlass.Constexpr = None,
     coop_args=(),
 ):
     cta_group = tcgen05.CtaGroup.TWO if two_cta else tcgen05.CtaGroup.ONE
@@ -1029,6 +1044,7 @@ def launch_grouped_gemm(
         prologue,
         wait_schedule,
         wait_tokens,
+        finalize,
         coop_args,
     ).launch(
         grid=[cluster_m, 1, num_clusters],

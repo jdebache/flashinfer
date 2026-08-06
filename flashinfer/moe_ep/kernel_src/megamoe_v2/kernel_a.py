@@ -91,6 +91,20 @@ _ROW_VEC_WORDS = 4
 
 
 @cute.jit
+def poll_i32(ptr) -> Int32:
+    """Read a flag another *block on this GPU* publishes.
+
+    A relaxed load, not ``atomic_add(x, 0)``.  The atomic form is a
+    read-modify-write: it cannot be served from a cached copy, so every poll is
+    a serialized round trip to the one L2 slice owning the line, and the
+    spinners contend with the very traffic they are waiting for.  A relaxed
+    load is cacheable and still ordered by the ``fence_acq_rel_gpu`` that
+    follows a successful wait.
+    """
+    return cute.arch.load(ptr, Int32, sem="relaxed", scope="gpu")
+
+
+@cute.jit
 def grid_barrier(gsync: cute.Tensor, gen: Int32, tid: Int32, bar, *, num_blocks: Int32):
     """Device-wide barrier across every block's dispatch group.
 
@@ -113,20 +127,24 @@ def grid_barrier(gsync: cute.Tensor, gen: Int32, tid: Int32, bar, *, num_blocks:
             cute.arch.fence_acq_rel_gpu()
             cute.arch.atomic_exch(gsync.iterator + 1, gen)
         else:
-            seen = cute.arch.atomic_add(gsync.iterator + 1, Int32(0))
-            while seen != gen:
-                seen = cute.arch.atomic_add(gsync.iterator + 1, Int32(0))
+            while poll_i32(gsync.iterator + 1) != gen:
+                pass
     bar.arrive_and_wait()
     return gen + Int32(1)
 
 
 @cute.jit
 def wait_schedule(args) -> None:
-    """GEMM warps: block until ``plan`` has published the tile prefix."""
-    sched = args[_SCHED]
-    seen = cute.arch.atomic_add(sched.iterator + 0, Int32(0))
-    while seen == Int32(0):
-        seen = cute.arch.atomic_add(sched.iterator + 0, Int32(0))
+    """One thread per block: block until ``plan`` has published the prefix.
+
+    Only ``tidx == 0`` polls.  The caller releases the rest of the GEMM warps
+    through the named barrier that already precedes the prefix staging, so the
+    polling population is one thread per block rather than all seven warps of
+    every block -- which at a 152-block grid was ~34k threads hammering a
+    single address for the whole duration of the dispatch head.
+    """
+    while poll_i32(args[_SCHED].iterator + 0) == Int32(0):
+        pass
     cute.arch.fence_acq_rel_gpu()
 
 
@@ -135,9 +153,8 @@ def wait_tokens(args, expert: Int32, *, tile_tokens: cutlass.Constexpr[int]) -> 
     """TMA-B: block until every row of ``expert``'s pool segment has landed."""
     prefix, ready = args[_PREFIX], args[_READY]
     needed = (prefix[expert + Int32(1)] - prefix[expert]) * Int32(tile_tokens)
-    seen = cute.arch.atomic_add(ready.iterator + expert, Int32(0))
-    while seen < needed:
-        seen = cute.arch.atomic_add(ready.iterator + expert, Int32(0))
+    while poll_i32(ready.iterator + expert) < needed:
+        pass
     cute.arch.fence_acq_rel_gpu()
 
 
@@ -378,11 +395,13 @@ def launch_kernel_a(
 ):
     cta_tile_m: cutlass.Constexpr[int] = mma_m // (2 if two_cta else 1)
     tile_tokens: cutlass.Constexpr[int] = mma_n
+    pool_tokens = cute.recast_tensor(coop_args[_POOL_I32], cutlass.Float4E2M1FN)
+    pool_scales = cute.recast_tensor(coop_args[_POOLSF_I32], cutlass.Float8E4M3FN)
     launch_grouped_gemm(
         w1,
-        coop_args[_POOL_I32],
+        pool_tokens,
         sf_w1,
-        coop_args[_POOLSF_I32],
+        pool_scales,
         (fc1_out, fc1_out_sf, coop_args[_POOLW]),
         coop_args[_PREFIX],
         stream,

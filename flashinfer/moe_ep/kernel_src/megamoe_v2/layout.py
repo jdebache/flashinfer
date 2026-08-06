@@ -232,8 +232,14 @@ def local_layout(config: KernelConfig) -> WorkspaceLayout:
                 _ALIGN_COUNTER,
                 resettable=True,
             ),
-            # Device-wide software barrier ticket for the dispatch grid sync.
+            # Device-wide software barrier tickets: arrival counter + release
+            # generation.  Kernel A and kernel B get their own so neither has
+            # to reason about the other's leftover generation number.
             Region("grid_sync", 2 * _BYTES_I32, _ALIGN_COUNTER, resettable=True),
+            Region("grid_sync_b", 2 * _BYTES_I32, _ALIGN_COUNTER, resettable=True),
+            # Set once by kernel A's plan step; the GEMM warps spin on it
+            # before they may decode a single tile.
+            Region("schedule_flag", _BYTES_I32, _ALIGN_COUNTER, resettable=True),
             # Routing staging, indexed by *global* expert: how many local pairs
             # go to each, and which.  Staged rather than written straight to
             # the destination because the slot index comes from a local atomic,

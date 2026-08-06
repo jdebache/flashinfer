@@ -231,3 +231,151 @@ def test_rerun_is_idempotent():
     launcher.run(pipe)
     torch.cuda.synchronize()
     torch.testing.assert_close(pipe.out.float(), got, atol=0, rtol=0)
+
+
+# --------------------------------------------------------------------------
+# the two-kernel form
+# --------------------------------------------------------------------------
+
+
+def _run_fused_pipeline(
+    *,
+    num_tokens,
+    hidden,
+    intermediate,
+    num_experts,
+    top_k,
+    clamp=None,
+    seed=5,
+    num_clusters=8,
+):
+    """Same problem, but as the two fused launches instead of nine staged ones."""
+    import cuda.bindings.driver as cuda
+
+    config = KernelConfig(
+        shape=ProblemShape(
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_experts,
+            top_k=top_k,
+            max_tokens_per_rank=num_tokens,
+        ),
+        topology=EpTopology(world_size=1, rank=0),
+        phase=Phase.FC1,
+        tile=TileConfig(mma_m=256, mma_n=128, mma_k=256, cluster_m=2, two_cta=True),
+        comm=CommConfig(invalid_expert_id=-1),
+        epilogue=EpilogueConfig(gate_up_clamp=clamp, apply_topk_in_fc1=True),
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    act = torch.randn(
+        num_tokens, hidden, dtype=torch.float32, device="cuda", generator=g
+    ).bfloat16()
+    w13 = (
+        torch.randn(
+            num_experts,
+            2 * intermediate,
+            hidden,
+            dtype=torch.float32,
+            device="cuda",
+            generator=g,
+        )
+        * 0.3
+    )
+    w2 = (
+        torch.randn(
+            num_experts,
+            hidden,
+            intermediate,
+            dtype=torch.float32,
+            device="cuda",
+            generator=g,
+        )
+        * 0.3
+    )
+    logits = torch.rand(num_tokens, num_experts, device="cuda", generator=g) ** 3
+    topk_ids = logits.topk(top_k, dim=-1).indices.to(torch.int32)
+    topk_ids[::9, -1] = -1
+    topk_weights = torch.rand(
+        num_tokens, top_k, dtype=torch.float32, device="cuda", generator=g
+    )
+
+    w1_codes, w1_sf, w13_dq = _quantize_weights(w13)
+    w2_codes, w2_sf, w2_dq = _quantize_weights(w2)
+    weights = launcher.Weights(w1=w1_codes, w1_sf=w1_sf, w2=w2_codes, w2_sf=w2_sf)
+
+    ws = launcher.allocate_workspaces(config, rank=0, alloc_shared=_local_allocator)
+    views = launcher.build_views(ws, config)
+    out = torch.zeros(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    pipe = launcher.compile_fused(
+        config,
+        rank=0,
+        ws=ws,
+        views=views,
+        weights=weights,
+        activation=act,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        out=out,
+        stream=stream,
+        num_clusters=num_clusters,
+    )
+    launcher.run_fused(pipe)
+    torch.cuda.synchronize()
+
+    expected = moe_reference(
+        hidden_states=(act,),
+        topk_ids=(topk_ids,),
+        topk_weights=(topk_weights,),
+        w13=(w13_dq,),
+        w2=(w2_dq,),
+        shape=config.shape,
+        topology=config.topology,
+        epilogue=config.epilogue,
+        invalid_expert_id=-1,
+    )[0]
+    return out.float(), expected.float(), pipe, topk_ids
+
+
+@pytest.mark.parametrize("top_k", [1, 2])
+def test_fused_pipeline_matches_reference(top_k):
+    """Two launches must produce what nine did, and what the oracle says."""
+    _require_blackwell()
+    got, expected, _, _ = _run_fused_pipeline(
+        num_tokens=256, hidden=512, intermediate=256, num_experts=4, top_k=top_k
+    )
+    _assert_matches(got, expected)
+
+
+def test_fused_pipeline_with_clamp():
+    _require_blackwell()
+    got, expected, _, _ = _run_fused_pipeline(
+        num_tokens=256,
+        hidden=512,
+        intermediate=256,
+        num_experts=4,
+        top_k=2,
+        clamp=2.0,
+    )
+    _assert_matches(got, expected)
+
+
+def test_fused_rejects_non_resident_grid():
+    """A grid larger than the SM count would hang in the device-wide barrier.
+
+    Checked on the host because the failure mode is a deadlock, which gives no
+    diagnostic at all.
+    """
+    _require_blackwell()
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    with pytest.raises(ValueError, match="co-resident"):
+        _run_fused_pipeline(
+            num_tokens=128,
+            hidden=512,
+            intermediate=256,
+            num_experts=2,
+            top_k=1,
+            num_clusters=sms,
+        )

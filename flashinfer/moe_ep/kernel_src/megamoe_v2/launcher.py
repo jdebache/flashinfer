@@ -47,6 +47,8 @@ from typing import Any, Callable
 import torch
 
 from . import combine as combine_mod
+from . import kernel_a as kernel_a_mod
+from . import kernel_b as kernel_b_mod
 from . import dispatch as dispatch_mod
 from . import fc1 as fc1_mod
 from . import sf_layout
@@ -161,6 +163,10 @@ class Views:
     pool_src: torch.Tensor
     fc1_out_fp4: torch.Tensor
     fc1_out_sf: torch.Tensor
+    grid_sync: torch.Tensor
+    grid_sync_b: torch.Tensor
+    schedule_flag: torch.Tensor
+    token_ready: torch.Tensor
 
 
 def build_views(ws: Workspaces, config: KernelConfig) -> Views:
@@ -232,6 +238,12 @@ def build_views(ws: Workspaces, config: KernelConfig) -> Views:
         fc1_out_sf=region(
             lo, ll, "fc1_out_sf", _U8, (ll.nbytes_of("fc1_out_sf"),)
         ).view(torch.float8_e4m3fn),
+        grid_sync=region(lo, ll, "grid_sync", _I32, (2,)),
+        grid_sync_b=region(lo, ll, "grid_sync_b", _I32, (2,)),
+        schedule_flag=region(lo, ll, "schedule_flag", _I32, (1,)),
+        # The readiness counters live in the first `local_experts` slots of the
+        # token-tile readiness region.
+        token_ready=region(lo, ll, "token_ready_count", _I32, (le,)),
     )
 
 
@@ -481,3 +493,186 @@ def run(pipeline: Pipeline) -> None:
     reset_counters(pipeline.ws, pipeline.config)
     for name in STAGE_ORDER:
         run_stage(pipeline, name)
+
+
+# --------------------------------------------------------------------------
+# fused: the two-kernel form
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class FusedPipeline:
+    """The two compiled kernels plus the buffers they were compiled against."""
+
+    config: KernelConfig
+    rank: int
+    ws: Workspaces
+    views: Views
+    out: torch.Tensor
+    kernel_a: Any
+    kernel_a_args: tuple
+    kernel_b: Any
+    kernel_b_args: tuple
+
+
+def compile_fused(
+    config: KernelConfig,
+    *,
+    rank: int,
+    ws: Workspaces,
+    views: Views,
+    weights: Weights,
+    activation: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    stream,
+    num_clusters: int = 8,
+    use_pdl: bool = True,
+) -> FusedPipeline:
+    """Compile the whole pipeline as two launches.
+
+    ``num_clusters`` is load-bearing here in a way it is not for the staged
+    path: both kernels run a device-wide barrier, which is only sound if every
+    block is resident at once.  At this smem footprint that means one block per
+    SM, so the grid must not exceed the SM count -- checked below rather than
+    left to chance, because the failure mode is a hang.
+    """
+    import cutlass.cute as cute
+    import cutlass.torch as ct
+
+    props = torch.cuda.get_device_properties(activation.device)
+    blocks = config.tile.cluster_m * num_clusters
+    if blocks > props.multi_processor_count:
+        raise ValueError(
+            f"grid of {blocks} blocks exceeds {props.multi_processor_count} SMs; "
+            "the in-kernel grid barrier requires a co-resident grid"
+        )
+
+    shape = config.shape
+    world = config.topology.world_size
+    le = config.experts_per_rank
+    v = views
+    mk = lambda t: ct.from_dlpack(t, assumed_align=16)
+    dev = activation.device
+    scalar = lambda x: mk(torch.tensor([x], dtype=_I32, device=dev))
+
+    coop_a = (
+        mk(activation),
+        mk(topk_ids),
+        mk(topk_weights),
+        mk(v.send_tokens_fp4),
+        mk(v.send_sf_e4m3),
+        mk(v.send_count),
+        mk(v.send_slot),
+        mk(v.send_weight),
+        mk(v.peer_expert_count),
+        mk(v.src_token_slot),
+        mk(v.src_topk_weight),
+        mk(v.barrier_signal),
+        mk(v.barrier_phase),
+        mk(v.expert_token_count),
+        mk(v.rank_pool_offset),
+        mk(v.token_block_prefix),
+        mk(v.send_tokens_i32),
+        mk(v.send_sf_i32),
+        mk(v.pool_tokens_i32),
+        mk(v.pool_sf_i32),
+        mk(v.pool_topk_weight),
+        mk(v.pool_src),
+        mk(ws.peer_offset),
+        mk(v.grid_sync),
+        mk(v.token_ready),
+        mk(v.schedule_flag),
+        scalar(activation.shape[0]),
+        scalar(rank),
+    )
+    args_a = (
+        mk(weights.w1),
+        mk(weights.w1_sf),
+        mk(v.fc1_out_fp4),
+        mk(v.fc1_out_sf),
+        coop_a,
+        stream,
+    )
+    ka = cute.compile(
+        kernel_a_mod.launch_kernel_a,
+        *args_a,
+        num_experts=shape.num_experts,
+        local_experts=le,
+        world=world,
+        intermediate=shape.intermediate,
+        hidden=shape.hidden,
+        pool_rows=config.pool_token_capacity,
+        max_tokens=shape.max_tokens_per_rank,
+        top_k=shape.top_k,
+        hidden_atoms=sf_layout.num_k_atoms_for(shape.hidden, NVFP4_BLOCK),
+        inter_atoms=sf_layout.num_k_atoms_for(shape.intermediate, NVFP4_BLOCK),
+        norm_const=config.epilogue.input_norm_const,
+        clamp=config.epilogue.gate_up_clamp,
+        apply_weight=config.epilogue.apply_topk_in_fc1,
+        mma_m=config.tile.mma_m,
+        mma_n=config.tile.mma_n,
+        cluster_m=config.tile.cluster_m,
+        two_cta=config.tile.two_cta,
+        num_clusters=num_clusters,
+        use_pdl=use_pdl,
+    )
+
+    coop_b = (
+        mk(v.combine_buf),
+        mk(v.pool_src),
+        mk(ws.peer_offset),
+        mk(topk_ids),
+        mk(out),
+        mk(v.grid_sync_b),
+        mk(v.barrier_signal),
+        mk(v.barrier_phase),
+        scalar(activation.shape[0]),
+        scalar(rank),
+    )
+    args_b = (
+        mk(weights.w2),
+        mk(weights.w2_sf),
+        mk(v.fc1_out_fp4),
+        mk(v.fc1_out_sf),
+        mk(v.token_block_prefix),
+        coop_b,
+        stream,
+    )
+    kb = cute.compile(
+        kernel_b_mod.launch_kernel_b,
+        *args_b,
+        local_experts=le,
+        num_experts=shape.num_experts,
+        world=world,
+        intermediate=shape.intermediate,
+        hidden=shape.hidden,
+        pool_rows=config.pool_token_capacity,
+        max_tokens=shape.max_tokens_per_rank,
+        top_k=shape.top_k,
+        mma_m=config.tile.mma_m,
+        mma_n=config.tile.mma_n,
+        cluster_m=config.tile.cluster_m,
+        two_cta=config.tile.two_cta,
+        num_clusters=num_clusters,
+        use_pdl=use_pdl,
+    )
+    return FusedPipeline(
+        config=config,
+        rank=rank,
+        ws=ws,
+        views=views,
+        out=out,
+        kernel_a=ka,
+        kernel_a_args=args_a,
+        kernel_b=kb,
+        kernel_b_args=args_b,
+    )
+
+
+def run_fused(pipeline: FusedPipeline) -> None:
+    """One MoE layer: two launches, and the counter reset that precedes them."""
+    reset_counters(pipeline.ws, pipeline.config)
+    pipeline.kernel_a(*pipeline.kernel_a_args)
+    pipeline.kernel_b(*pipeline.kernel_b_args)

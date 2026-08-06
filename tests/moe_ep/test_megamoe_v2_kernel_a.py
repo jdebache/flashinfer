@@ -11,19 +11,9 @@ numerics one.
 Failures here tend to be hangs, not wrong answers -- a grid barrier that not
 every block reaches, or a readiness counter that never hits its target.
 
-STATUS: xfail.  The first deadlock (GEMM warps blocking on the schedule flag
-*before* the block-wide pipeline init that the dispatch warps also had to
-reach) is fixed.  What remains is a misaligned shared/local access reported in
-warp 6 -- the TMA-B warp -- on every lane, in every block.  Bisected so far:
-
-* it is not the dispatch work: a prologue trimmed to "write a prefix and set
-  the schedule flag" still faults;
-* it is not the token gate: disabling ``wait_tokens`` does not help;
-* it is not block-dimension/warpgroup alignment: 256, 352 and 384 all fault,
-  and removing the ``setmaxnreg`` calls changes nothing;
-* it does not reproduce with ``dispatch_warps=0``, which is the configuration
-  every other test uses -- so the staged path and all 144 existing tests are
-  unaffected.
+Dispatch moves the pool through Int32 aliases, while GEMM consumes the same
+storage as FP4/E4M3.  This test keeps the schedule nonempty so the typed TMA-B
+handoff is exercised.
 """
 
 from __future__ import annotations
@@ -197,13 +187,6 @@ def _run_fused(
     )
 
 
-# Skipped, not xfailed: the fault is a misaligned address, which is sticky for
-# the whole CUDA context, so merely launching it fails every later test in the
-# process.  Drop the marker to work on it.
-@pytest.mark.skip(
-    reason="fused kernel A faults in the TMA-B warp whenever dispatch warps "
-    "are present; see the module docstring for what is already ruled out"
-)
 def test_kernel_a_runs_and_schedules():
     """The fused kernel completes, and its device-built schedule is right."""
     _require_blackwell()
