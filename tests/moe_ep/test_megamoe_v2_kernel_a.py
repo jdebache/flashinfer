@@ -224,8 +224,7 @@ def test_kernel_a_pads_an_empty_expert():
     )
     assert tuple(int(v) for v in r["prefix"]) == (0, 1, 2)
     assert tuple(int(v) for v in r["ready"]) == (_TILE, _TILE)
-    counts = tuple(int((r["topk_ids"] == e).sum()) for e in range(2))
-    assert tuple(int(v) for v in r["peer_count"]) == tuple(c + 1 for c in counts)
+    assert tuple(int(v) for v in r["peer_count"]) == (0, 0)
     assert (r["pool_src"][_TILE : 2 * _TILE] == -1).all()
 
 
@@ -239,7 +238,7 @@ def test_kernel_a_publishes_all_empty_experts():
         top_k=1,
         all_invalid=True,
     )
-    assert tuple(int(v) for v in r["peer_count"]) == (1, 1)
+    assert tuple(int(v) for v in r["peer_count"]) == (0, 0)
     assert tuple(int(v) for v in r["prefix"]) == (0, 1, 2)
     assert tuple(int(v) for v in r["ready"]) == (_TILE, _TILE)
     assert (r["pool_src"][: 2 * _TILE] == -1).all()

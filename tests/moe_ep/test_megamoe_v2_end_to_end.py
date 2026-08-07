@@ -377,7 +377,7 @@ def test_fused_all_slots_invalid():
     )
     torch.testing.assert_close(got, expected, atol=0, rtol=0)
     assert got.abs().max() == 0.0
-    assert tuple(int(v) for v in pipe.views.peer_expert_count) == (1, 1, 1, 1)
+    assert tuple(int(v) for v in pipe.views.peer_expert_count) == (0, 0, 0, 0)
 
 
 def test_fused_rerun_is_idempotent():

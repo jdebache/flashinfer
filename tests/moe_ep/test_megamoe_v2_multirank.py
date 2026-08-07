@@ -149,7 +149,16 @@ def _nvshmem_allocator(world: int, my_pe: int):
 
 
 def _run(
-    rank, world, *, num_tokens, hidden, intermediate, num_experts, top_k, num_clusters=8
+    rank,
+    world,
+    *,
+    num_tokens,
+    hidden,
+    intermediate,
+    num_experts,
+    top_k,
+    num_clusters=8,
+    iterations=1,
 ):
     import cuda.bindings.driver as cuda
 
@@ -234,7 +243,8 @@ def _run(
     # others are still tracing.  Correct either way, but it makes a hang here
     # mean a real bug rather than a slow compile.
     torch.distributed.barrier()
-    launcher.run_fused(pipe)
+    for _ in range(iterations):
+        launcher.run_fused(pipe)
     torch.cuda.synchronize()
     torch.distributed.barrier()
 
@@ -304,6 +314,7 @@ def test_fused_pipeline_multirank(top_k):
         intermediate=256,
         num_experts=4 * world,
         top_k=top_k,
+        iterations=3,
     )
     assert expected.abs().sum() > 0, "reference is degenerate"
     rel = (got - expected).norm().item() / expected.norm().item()

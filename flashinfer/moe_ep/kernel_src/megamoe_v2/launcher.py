@@ -114,6 +114,8 @@ def allocate_workspaces(
             f"got {len(peer_bases)} peer bases for a world of "
             f"{config.topology.world_size}"
         )
+    shared[: sl.total_bytes].zero_()
+    torch.cuda.current_stream(shared.device).synchronize()
     base = int(peer_bases[rank])
     return Workspaces(
         local=local,
@@ -125,14 +127,13 @@ def allocate_workspaces(
 
 
 def reset_counters(ws: Workspaces, config: KernelConfig) -> None:
-    """Zero the counter prefixes between launches.
+    """Zero rank-local counters between launches.
 
-    One fill each, because both layouts pack every resettable region into a
-    contiguous prefix -- and deliberately leave the barrier phase and signal
-    outside it, since a barrier that forgets its phase deadlocks the group.
+    Shared metadata is overwritten every iteration.  Fused peer-count slots
+    are cleared by their owner after consumption, avoiding a cross-rank race
+    between a host reset and the next publication.
     """
     ws.local[: local_layout(config).reset_prefix_bytes].zero_()
-    ws.shared[: shared_layout(config).reset_prefix_bytes].zero_()
 
 
 @dataclasses.dataclass(frozen=True)

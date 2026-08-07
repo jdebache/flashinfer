@@ -137,12 +137,13 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
             # source owns one row, so no rank ever needs a remote atomic to
             # find where to write.  Staged dispatch stores the raw count behind
             # a global barrier; fused dispatch stores count + 1 so zero is an
-            # unpublished sentinel for its per-expert rendezvous.
+            # unpublished sentinel for its per-expert rendezvous.  The fused
+            # owner clears each slot after consuming it, so a faster rank
+            # cannot race a host-side reset on the next iteration.
             Region(
                 "peer_expert_count",
                 world * local_experts * _BYTES_I64,
                 _ALIGN_COUNTER,
-                resettable=True,
             ),
             # Summed per local expert; this is what both kernels' schedules
             # read to size the tile space.
@@ -150,7 +151,6 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
                 "expert_token_count",
                 local_experts * _BYTES_I64,
                 _ALIGN_COUNTER,
-                resettable=True,
             ),
             # (local expert, source rank, slot) -> packed (token, topk slot) on
             # the source rank; tells a puller which row to fetch.
@@ -158,7 +158,6 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
                 "src_token_slot",
                 local_experts * world * max_pairs * _BYTES_I32,
                 _ALIGN_COUNTER,
-                resettable=True,
             ),
             # Per pushed pair, the routing weight that travels with it.  Sent
             # rather than read back later: the same token row goes to `top_k`
@@ -168,7 +167,6 @@ def shared_layout(config: KernelConfig) -> WorkspaceLayout:
                 "src_topk_weight",
                 local_experts * world * max_pairs * _BYTES_F32,
                 _ALIGN_COUNTER,
-                resettable=True,
             ),
             # One slot per source rank: rank r publishes its phase into slot r
             # of every peer, so the barrier is flag-based and needs no remote

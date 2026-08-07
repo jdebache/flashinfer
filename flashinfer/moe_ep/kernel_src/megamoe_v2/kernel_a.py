@@ -206,59 +206,62 @@ def dispatch_prologue(
         pair += stride
     gen = grid_barrier(args[_GSYNC], gen, tid, bar, num_blocks=num_blocks)
 
-    # --- publish, plan, and pull one expert at a time ---
-    row_words: cutlass.Constexpr[int] = hidden // 8
-    expert = flat_block
-    while expert < Int32(num_experts):
-        # Blocks own a grid-stride sequence of experts.  A local ticket keeps
-        # publication in the same global-expert order on every source rank.
-        if tid == Int32(0):
-            while poll_i32(args[_GSYNC].iterator + 0) != expert:
-                pass
-        bar.arrive_and_wait()
-
-        dst = expert // Int32(local_experts)
-        le = expert % Int32(local_experts)
-        off = args[_PEER][dst]
-        rc = peer_view(args[_PCOUNT], off, args[_PCOUNT].layout, cutlass.Int64, align=8)
-        rs = peer_view(args[_PSLOT], off, args[_PSLOT].layout, cutlass.Int32)
-        rw = peer_view(args[_PWEIGHT], off, args[_PWEIGHT].layout, cutlass.Float32)
-        count = args[_SCOUNT][expert]
-        base = (le * Int32(world) + my_rank) * Int32(max_pairs)
-        i = tid
-        while i < count:
-            rs[base + i] = args[_SSLOT][expert, i]
-            rw[base + i] = args[_SWEIGHT][expert, i]
-            i += Int32(threads)
-        bar.arrive_and_wait()
-        if tid == Int32(0):
-            # Zero is the unpublished sentinel, so a real zero count travels
-            # as one.  The release fence covers the pair list above.
-            cute.arch.fence_acq_rel_sys()
-            cute.arch.atomic_exch(
-                rc.iterator + my_rank * Int32(local_experts) + le,
-                Int64(count) + Int64(1),
+    # One warp publishes every global expert in order.  Owner CTAs consume
+    # independent local experts as soon as their counts arrive, so publication
+    # never waits for a pull and needs no cross-CTA ticket.
+    if flat_block == num_blocks - Int32(1) and warp == Int32(0):
+        expert = Int32(0)
+        while expert < Int32(num_experts):
+            dst = expert // Int32(local_experts)
+            le = expert % Int32(local_experts)
+            off = args[_PEER][dst]
+            rc = peer_view(
+                args[_PCOUNT], off, args[_PCOUNT].layout, cutlass.Int64, align=8
             )
-            cute.arch.atomic_exch(args[_GSYNC].iterator + 0, expert + Int32(1))
-        bar.arrive_and_wait()
+            rs = peer_view(args[_PSLOT], off, args[_PSLOT].layout, cutlass.Int32)
+            rw = peer_view(
+                args[_PWEIGHT], off, args[_PWEIGHT].layout, cutlass.Float32
+            )
+            count = args[_SCOUNT][expert]
+            base = (le * Int32(world) + my_rank) * Int32(max_pairs)
+            i = lane
+            while i < count:
+                rs[base + i] = args[_SSLOT][expert, i]
+                rw[base + i] = args[_SWEIGHT][expert, i]
+                i += Int32(_WARP)
+            cute.arch.sync_warp()
+            if lane == Int32(0):
+                cute.arch.store(
+                    rc.iterator + my_rank * Int32(local_experts) + le,
+                    Int64(count) + Int64(1),
+                    sem="release",
+                    scope="sys",
+                )
+            expert += Int32(1)
 
-        if dst == my_rank:
+    row_words: cutlass.Constexpr[int] = hidden // 8
+    owner_workers = num_blocks - Int32(1)
+    if owner_workers < Int32(1):
+        owner_workers = Int32(1)
+    if flat_block < owner_workers:
+        le = flat_block
+        while le < Int32(local_experts):
             if tid == Int32(0):
                 total = Int32(0)
                 for r in cutlass.range_constexpr(world):
                     slot = r * local_experts + le
-                    seen = cute.arch.atomic_add(args[_PCOUNT].iterator + slot, Int64(0))
+                    count_ptr = args[_PCOUNT].iterator + slot
+                    seen = cute.arch.load(
+                        count_ptr, Int64, sem="acquire", scope="sys"
+                    )
                     while seen == Int64(0):
-                        seen = cute.arch.atomic_add(
-                            args[_PCOUNT].iterator + slot, Int64(0)
+                        seen = cute.arch.load(
+                            count_ptr, Int64, sem="acquire", scope="sys"
                         )
                     args[_RANKOFF][le * world + r] = total
                     total += Int32(seen - Int64(1))
-                cute.arch.fence_acq_rel_sys()
+                    args[_PCOUNT][slot] = Int64(0)
 
-                # The preceding local expert owns this segment's base.  Each
-                # nonempty published prefix entry therefore doubles as its
-                # readiness flag.
                 if le > Int32(0):
                     while poll_i32(args[_PREFIX].iterator + le) == Int32(0):
                         pass
@@ -342,9 +345,7 @@ def dispatch_prologue(
             if tid == Int32(0):
                 cute.arch.fence_acq_rel_gpu()
                 cute.arch.atomic_exch(args[_READY].iterator + le, span)
-            bar.arrive_and_wait()
-
-        expert += num_blocks
+            le += owner_workers
 
 
 @cute.jit
