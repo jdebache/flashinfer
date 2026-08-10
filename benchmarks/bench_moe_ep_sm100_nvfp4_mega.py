@@ -4,11 +4,11 @@ The default geometry matches Mistral-Large-3-675B-Instruct-2512-NVFP4:
 hidden 7168, expert intermediate 4096, 128 routed experts, and top-k 4.
 Four torchrun ranks therefore hold 32 experts each.
 
-Two prestaged-input series are measured with per-iteration CUDA events and an
-L2 flush outside each timed window:
+Two prestaged-input series are captured as CUDA Graphs and measured with every
+replay device-drained and barrier-aligned across ranks:
 
 * ``kernel``: the prebuilt bare MegaMoE launch thunk.
-* ``e2e_pipelined``: the FlashInfer compute path, including output copy.
+* ``e2e``: the FlashInfer compute path, including output copy.
 
 Both include fused dispatch, expert FC1/SwiGLU/FC2, and combine. Activation
 quantization/staging and the model's shared expert are outside the timed region.
@@ -57,9 +57,6 @@ from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel  # noqa: E
 from flashinfer.moe_ep.core.runtime import (  # noqa: E402
     nvfp4_cutedsl_runtime_requirements,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (  # noqa: E402
-    nvfp4_mega_launch_thunk,
-)
 
 DEFAULT_TOKENS = tuple(2**power for power in range(2, 15))
 CSV_COLUMNS = (
@@ -74,6 +71,9 @@ CSV_COLUMNS = (
     "in_kernel_fc2_reduce",
     "warmup",
     "iters",
+    "timing_mode",
+    "routing",
+    "l2_flush_mib",
     "status",
     "kernel_critical_min_us",
     "kernel_critical_median_us",
@@ -98,6 +98,11 @@ class PointResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class CapturedCall:
+    graph: torch.cuda.CUDAGraph
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -118,7 +123,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-up-clamp", type=float, default=None)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--l2-flush-mib", type=int, default=300)
+    parser.add_argument(
+        "--l2-flush-mib",
+        type=int,
+        default=0,
+        help="MiB to flush before each aligned sample; zero measures warm-cache replay.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
@@ -134,6 +144,8 @@ def _validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, ...]
         raise ValueError("--num-experts must be divisible by the world size")
     if args.top_k <= 0 or args.top_k > args.num_experts:
         raise ValueError("--top-k must be in [1, num_experts]")
+    if args.top_k != world_size:
+        raise ValueError("per-token EP-balanced routing requires top-k == world size")
     if args.hidden % 64 != 0 or args.intermediate % 64 != 0:
         raise ValueError("--hidden and --intermediate must be multiples of 64")
     if args.warmup < 0 or args.iters <= 0 or args.l2_flush_mib < 0:
@@ -151,9 +163,12 @@ def _balanced_routing(
     world_size: int,
     device: Any,
 ) -> Any:
-    flat = torch.arange(num_tokens * top_k, device=device, dtype=torch.int64)
-    offset = rank * (num_experts // world_size)
-    return ((flat + offset) % num_experts).view(num_tokens, top_k)
+    local_experts = num_experts // world_size
+    token_ids = torch.arange(num_tokens, device=device, dtype=torch.int64)[:, None]
+    route_ids = torch.arange(top_k, device=device, dtype=torch.int64)[None, :]
+    target_ranks = (rank + route_ids) % world_size
+    local_ids = (token_ids * top_k + route_ids + rank) % local_experts
+    return target_ranks * local_experts + local_ids
 
 
 def _make_inputs(
@@ -241,31 +256,44 @@ def _make_transformed_weights(
     return transformed
 
 
-def _time_pipelined(
-    call: Callable[[], Any],
+def _capture_call(call: Callable[[], Any]) -> CapturedCall:
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    return CapturedCall(graph=graph)
+
+
+def _prepare_aligned_sample(l2_flush: Any | None) -> None:
+    if l2_flush is not None:
+        l2_flush.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def _time_graph(
+    captured: CapturedCall,
     *,
     warmup: int,
     iters: int,
     l2_flush: Any | None,
 ) -> tuple[float, ...]:
     for _ in range(warmup):
-        call()
-    torch.cuda.synchronize()
-    dist.barrier()
+        _prepare_aligned_sample(l2_flush)
+        captured.graph.replay()
+        torch.cuda.synchronize()
 
-    starts = tuple(torch.cuda.Event(enable_timing=True) for _ in range(iters))
-    stops = tuple(torch.cuda.Event(enable_timing=True) for _ in range(iters))
-    for start, stop in zip(starts, stops, strict=True):
-        if l2_flush is not None:
-            l2_flush.zero_()
+    start = torch.cuda.Event(enable_timing=True)
+    stop = torch.cuda.Event(enable_timing=True)
+    samples: tuple[float, ...] = ()
+    for _ in range(iters):
+        _prepare_aligned_sample(l2_flush)
         start.record()
-        call()
+        captured.graph.replay()
         stop.record()
-    torch.cuda.synchronize()
-    return tuple(
-        start.elapsed_time(stop) * 1e3
-        for start, stop in zip(starts, stops, strict=True)
-    )
+        torch.cuda.synchronize()
+        samples += (start.elapsed_time(stop) * 1e3,)
+    dist.barrier()
+    return samples
 
 
 def _run_point(
@@ -311,17 +339,56 @@ def _run_point(
 
         backend.compute(workspace, transformed, output=output)
         torch.cuda.synchronize()
+        if not torch.isfinite(output).all().item():
+            raise RuntimeError("eager output contains non-finite values")
+        eager_output = output.clone()
+        torch.cuda.synchronize()
         dist.barrier()
-        thunk = nvfp4_mega_launch_thunk(transformed[0], transformed[1], workspace)
 
-        kernel_samples = _time_pipelined(
-            thunk,
+        kernel_graph = _capture_call(
+            lambda: backend.compute(workspace, transformed, output=None)
+        )
+        dist.barrier()
+        e2e_graph = _capture_call(
+            lambda: backend.compute(workspace, transformed, output=output)
+        )
+        dist.barrier()
+        workspace.output_activation[:tokens].fill_(float("nan"))
+        torch.cuda.synchronize()
+        _prepare_aligned_sample(None)
+        kernel_graph.graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        torch.testing.assert_close(
+            workspace.output_activation[:tokens],
+            eager_output,
+            rtol=5e-2,
+            atol=5e-2,
+            msg="bare-kernel CUDA Graph replay diverged from eager output",
+        )
+
+        output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        _prepare_aligned_sample(None)
+        e2e_graph.graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        torch.testing.assert_close(
+            output,
+            eager_output,
+            rtol=5e-2,
+            atol=5e-2,
+            msg="CUDA Graph replay diverged from eager output",
+        )
+
+        kernel_samples = _time_graph(
+            kernel_graph,
             warmup=args.warmup,
             iters=args.iters,
             l2_flush=l2_flush,
         )
-        e2e_samples = _time_pipelined(
-            lambda: backend.compute(workspace, transformed, output=output),
+        e2e_samples = _time_graph(
+            e2e_graph,
             warmup=args.warmup,
             iters=args.iters,
             l2_flush=l2_flush,
@@ -388,6 +455,9 @@ def _row(
         "in_kernel_fc2_reduce": args.in_kernel_fc2_reduce,
         "warmup": args.warmup,
         "iters": args.iters,
+        "timing_mode": "aligned_cuda_graph",
+        "routing": "per_token_ep_balanced",
+        "l2_flush_mib": args.l2_flush_mib,
         "status": result.status,
         "error": result.error,
     }
@@ -460,7 +530,11 @@ def main() -> int:
             if args.output is not None:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 output_file = args.output.open("w", newline="")
-                writer = csv.DictWriter(output_file, fieldnames=CSV_COLUMNS)
+                writer = csv.DictWriter(
+                    output_file,
+                    fieldnames=CSV_COLUMNS,
+                    lineterminator="\n",
+                )
                 writer.writeheader()
 
         local_experts = args.num_experts // world_size
