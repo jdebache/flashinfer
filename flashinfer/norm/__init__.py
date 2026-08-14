@@ -35,6 +35,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
+    fused_moe_add_residual_rmsnorm_trace,
     fused_rmsnorm_silu_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
@@ -50,9 +51,13 @@ from ..utils import (
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
+    version_at_least,
 )
 
 # Always import gen_norm_module for JIT warmup and CUDA fallback
+from ..jit.fused_moe_add_residual_rmsnorm import (
+    gen_fused_moe_add_residual_rmsnorm_sm100_module,
+)
 from ..jit.norm import gen_norm_module
 
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
@@ -109,6 +114,13 @@ def get_norm_module():
     implementation and no CuTe DSL alternative.
     """
     return gen_norm_module().build_and_load()
+
+
+@functools.cache
+def get_fused_moe_add_residual_rmsnorm_sm100_module():
+    """Get or compile the SM100/SM103 kernel module."""
+
+    return gen_fused_moe_add_residual_rmsnorm_sm100_module().build_and_load()
 
 
 def _normalize_scale_tensor(
@@ -314,6 +326,233 @@ def _fused_add_rmsnorm_fake(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     pass
+
+
+_FUSED_MOE_ADD_RESIDUAL_RMSNORM_HIDDEN_SIZE = 7168
+_FUSED_MOE_ADD_RESIDUAL_RMSNORM_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+
+
+def _check_fused_moe_add_residual_rmsnorm_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    shape: tuple[int, ...],
+    device: torch.device,
+) -> None:
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if tensor.dtype != torch.bfloat16:
+        raise ValueError(f"{name} must be bfloat16, got {tensor.dtype}")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _check_fused_moe_add_residual_rmsnorm_inputs(
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual_out: torch.Tensor,
+) -> None:
+    if not routed_output.is_cuda:
+        raise ValueError("routed_output must be a CUDA tensor")
+    if routed_output.ndim != 2:
+        raise ValueError(
+            f"routed_output must be 2D, got {routed_output.ndim} dimensions"
+        )
+
+    shape = tuple(routed_output.shape)
+    device = routed_output.device
+    _check_fused_moe_add_residual_rmsnorm_tensor(
+        routed_output, "routed_output", shape, device
+    )
+    _check_fused_moe_add_residual_rmsnorm_tensor(
+        shared_output, "shared_output", shape, device
+    )
+    _check_fused_moe_add_residual_rmsnorm_tensor(residual, "residual", shape, device)
+    _check_fused_moe_add_residual_rmsnorm_tensor(weight, "weight", (shape[1],), device)
+    _check_fused_moe_add_residual_rmsnorm_tensor(
+        hidden_states, "hidden_states", shape, device
+    )
+    _check_fused_moe_add_residual_rmsnorm_tensor(
+        residual_out, "residual_out", shape, device
+    )
+    input_ptrs = {
+        routed_output.data_ptr(),
+        shared_output.data_ptr(),
+        residual.data_ptr(),
+        weight.data_ptr(),
+    }
+    if routed_output.numel() != 0 and (
+        hidden_states.data_ptr() == residual_out.data_ptr()
+        or hidden_states.data_ptr() in input_ptrs
+        or residual_out.data_ptr() in input_ptrs
+    ):
+        raise ValueError("output tensors must not alias inputs or each other")
+
+
+def _use_fused_moe_add_residual_rmsnorm_sm100(
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual_out: torch.Tensor,
+) -> bool:
+    if (
+        os.environ.get("FLASHINFER_DISABLE_FUSED_MOE_ADD_RESIDUAL_RMSNORM_SM100", "0")
+        == "1"
+    ):
+        return False
+    tensors = (
+        routed_output,
+        shared_output,
+        residual,
+        weight,
+        hidden_states,
+        residual_out,
+    )
+    compute_capability = get_compute_capability(routed_output.device)
+    minimum_cuda_version = "12.8" if compute_capability == (10, 0) else "12.9"
+    return (
+        routed_output.shape[1] == _FUSED_MOE_ADD_RESIDUAL_RMSNORM_HIDDEN_SIZE
+        and compute_capability
+        in _FUSED_MOE_ADD_RESIDUAL_RMSNORM_SUPPORTED_COMPUTE_CAPABILITIES
+        and version_at_least(torch.version.cuda, minimum_cuda_version)
+        and all(tensor.data_ptr() % 16 == 0 for tensor in tensors)
+    )
+
+
+@register_custom_op(
+    "flashinfer::fused_moe_add_residual_rmsnorm",
+    mutates_args=("hidden_states", "residual_out"),
+)
+def _fused_moe_add_residual_rmsnorm_impl(
+    hidden_states: torch.Tensor,
+    residual_out: torch.Tensor,
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> None:
+    if _use_fused_moe_add_residual_rmsnorm_sm100(
+        routed_output,
+        shared_output,
+        residual,
+        weight,
+        hidden_states,
+        residual_out,
+    ):
+        get_fused_moe_add_residual_rmsnorm_sm100_module().fused_moe_add_residual_rmsnorm_sm100(
+            routed_output,
+            shared_output,
+            residual,
+            weight,
+            hidden_states,
+            residual_out,
+            eps,
+        )
+        return
+
+    if routed_output.shape[0] == 0:
+        return
+    torch.add(routed_output, shared_output, out=hidden_states)
+    residual_out.copy_(residual)
+    fused_add_rmsnorm(hidden_states, residual_out, weight, eps)
+
+
+@register_fake_op("flashinfer::fused_moe_add_residual_rmsnorm")
+def _fused_moe_add_residual_rmsnorm_fake(
+    hidden_states: torch.Tensor,
+    residual_out: torch.Tensor,
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> None:
+    pass
+
+
+@flashinfer_api(trace=fused_moe_add_residual_rmsnorm_trace)
+def fused_moe_add_residual_rmsnorm(
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    hidden_states: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Fuse MoE output addition, residual accumulation, and RMSNorm.
+
+    The routed and shared outputs are added in BF16. Residual accumulation and
+    RMS statistics use FP32 before both outputs are converted back to BF16.
+    The optimized kernel is selected on SM100 or SM103 when ``hidden_size ==
+    7168``; other supported shapes and architectures use an equivalent
+    composition. SM100 requires CUDA 12.8 or newer, while SM103 requires CUDA
+    12.9 or newer.
+
+    Parameters
+    ----------
+    routed_output: torch.Tensor
+        Contiguous BF16 CUDA tensor containing the routed-expert output, with
+        shape ``(num_tokens, hidden_size)``.
+    shared_output: torch.Tensor
+        Contiguous BF16 CUDA tensor containing the shared-expert output, with
+        shape ``(num_tokens, hidden_size)``.
+    residual: torch.Tensor
+        Contiguous BF16 CUDA tensor containing the input residual, with shape
+        ``(num_tokens, hidden_size)``.
+    weight: torch.Tensor
+        Contiguous BF16 CUDA tensor with shape ``(hidden_size,)``.
+    eps: float
+        Epsilon for numerical stability.
+    hidden_states: torch.Tensor | None
+        Optional contiguous BF16 buffer for the normalized hidden states, with
+        shape ``(num_tokens, hidden_size)``.
+    residual_out: torch.Tensor | None
+        Optional contiguous BF16 buffer for the accumulated residual, with
+        shape ``(num_tokens, hidden_size)``. Supplying both output buffers
+        avoids allocation and is suitable for CUDA graph capture after JIT
+        warmup.
+
+    Returns
+    -------
+    hidden_states: torch.Tensor
+        The normalized hidden states.
+    residual_out: torch.Tensor
+        The accumulated residual.
+    """
+    if routed_output.ndim != 2:
+        raise ValueError(
+            f"routed_output must be 2D, got {routed_output.ndim} dimensions"
+        )
+    if hidden_states is None:
+        hidden_states = torch.empty_like(routed_output)
+    if residual_out is None:
+        residual_out = torch.empty_like(residual)
+    _check_fused_moe_add_residual_rmsnorm_inputs(
+        routed_output,
+        shared_output,
+        residual,
+        weight,
+        hidden_states,
+        residual_out,
+    )
+    _fused_moe_add_residual_rmsnorm_impl(
+        hidden_states,
+        residual_out,
+        routed_output,
+        shared_output,
+        residual,
+        weight,
+        eps,
+    )
+    return hidden_states, residual_out
 
 
 @flashinfer_api(trace=fused_add_rmsnorm_quant_trace)
@@ -1816,6 +2055,7 @@ __all__ = [
     "rmsnorm",
     "rmsnorm_quant",
     "fused_add_rmsnorm",
+    "fused_moe_add_residual_rmsnorm",
     "fused_add_rmsnorm_quant",
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",

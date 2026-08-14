@@ -108,6 +108,9 @@ from .jit.mhc import gen_mhc_module
 from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
+from .jit.fused_moe_add_residual_rmsnorm import (
+    gen_fused_moe_add_residual_rmsnorm_sm100_module,
+)
 from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
     select_knobs,
@@ -701,6 +704,8 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        if has_sm100 or has_sm103:
+            jit_specs.append(gen_fused_moe_add_residual_rmsnorm_sm100_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:

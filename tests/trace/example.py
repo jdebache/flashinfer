@@ -16,6 +16,7 @@ Results:
 - We would get these example json files under fi_trace_out directory:
 bmm_mxfp8_N128_K128.json
 fused_add_rmsnorm_h5120.json
+fused_moe_add_residual_rmsnorm_h7168.json
 fused_add_rmsnorm_quant_h7168.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
@@ -142,6 +143,16 @@ x = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 res = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 w = torch.ones(5120, dtype=torch.bfloat16, device=device)
 flashinfer.fused_add_rmsnorm(x, res, w)
+
+# ── fused MoE output add + residual + RMSNorm (DeepSeek-V3, hidden=7168) ─────
+moe_shape = (64, 7168)
+moe_routed = torch.randn(moe_shape, dtype=torch.bfloat16, device=device)
+moe_shared = torch.randn(moe_shape, dtype=torch.bfloat16, device=device)
+moe_residual = torch.randn(moe_shape, dtype=torch.bfloat16, device=device)
+moe_weight = torch.ones(7168, dtype=torch.bfloat16, device=device)
+flashinfer.fused_moe_add_residual_rmsnorm(
+    moe_routed, moe_shared, moe_residual, moe_weight
+)
 
 # ── rmsnorm_quant + fused_add_rmsnorm_quant (DeepSeek-V3 down-proj, h=7168) ──
 # Quantize to FP8 E4M3 after normalization; scale is per-tensor.

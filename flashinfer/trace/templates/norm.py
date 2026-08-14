@@ -252,6 +252,110 @@ fused_add_rmsnorm_trace = TraceTemplate(
     init=_fused_add_rmsnorm_init,
 )
 
+# ── Fused MoE Add + Residual + RMSNorm ───────────────────────────────────────
+
+
+def _fused_moe_add_residual_rmsnorm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    hidden_rtol=2e-2,
+    hidden_atol=2e-2,
+    **_unused,
+):
+    from flashinfer.trace import default_check
+
+    if isinstance(reference_outputs, dict):
+        reference_hidden = reference_outputs["hidden_states"]
+        reference_residual = reference_outputs["residual_out"]
+        actual_hidden = actual_outputs["hidden_states"]
+        actual_residual = actual_outputs["residual_out"]
+    else:
+        reference_hidden, reference_residual = reference_outputs
+        actual_hidden, actual_residual = actual_outputs
+
+    residual_matches = default_check(
+        [reference_residual],
+        [actual_residual],
+        rtol=0.0,
+        atol=0.0,
+        min_cos_sim=None,
+    )
+    return residual_matches and default_check(
+        [reference_hidden],
+        [actual_hidden],
+        rtol=hidden_rtol,
+        atol=hidden_atol,
+    )
+
+
+@torch.no_grad()
+def _fused_moe_add_residual_rmsnorm_reference(
+    routed_output, shared_output, residual, weight
+):
+    """MoE output add, residual accumulation, and RMSNorm with BF16 rounding."""
+
+    eps = 1e-6
+    moe_output = routed_output + shared_output
+    residual_fp32 = moe_output.float() + residual.float()
+    residual_out = residual_fp32.to(residual.dtype)
+    inv_rms = torch.rsqrt(residual_fp32.square().mean(dim=-1, keepdim=True) + eps)
+    hidden_states = (residual_fp32 * inv_rms * weight.float()).to(routed_output.dtype)
+    return hidden_states, residual_out
+
+
+def _fused_moe_add_residual_rmsnorm_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 7168,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    torch.manual_seed(seed)
+    shape = (num_tokens, hidden_size)
+    return {
+        "routed_output": torch.randn(shape, dtype=torch.bfloat16, device=device),
+        "shared_output": torch.randn(shape, dtype=torch.bfloat16, device=device),
+        "residual": torch.randn(shape, dtype=torch.bfloat16, device=device),
+        "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+    }
+
+
+fused_moe_add_residual_rmsnorm_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="fused_moe_add_residual_rmsnorm",
+    description=(
+        "Fused routed/shared MoE output add, residual accumulation, and RMSNorm. "
+        "The routed/shared add is rounded to BF16 and epsilon is fixed at 1e-6."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "routed_output": Tensor(["num_tokens", "hidden_size"]),
+        "shared_output": Tensor(["num_tokens", "hidden_size"]),
+        "residual": Tensor(["num_tokens", "hidden_size"]),
+        "weight": Tensor(["hidden_size"]),
+    },
+    outputs={
+        "hidden_states": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="hidden_states",
+            dtype_from="routed_output",
+        ),
+        "residual_out": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="residual_out",
+            dtype_from="residual",
+        ),
+    },
+    tags=["status:verified", "fused", "sm100", "sm103"],
+    reference=_fused_moe_add_residual_rmsnorm_reference,
+    check=_fused_moe_add_residual_rmsnorm_check,
+    init=_fused_moe_add_residual_rmsnorm_init,
+)
+
 # ── RMSNorm + FP8 Quantize ────────────────────────────────────────────────────
 
 
