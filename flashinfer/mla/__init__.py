@@ -14,6 +14,7 @@
 
 from ._core import *  # noqa: F401,F403
 from ._projection import fused_qkv_a_proj_norm_rope as fused_qkv_a_proj_norm_rope
+from ._projection import prepare_qkv_a_proj_weight as prepare_qkv_a_proj_weight
 
 
 _PRIMS_TS_LAZY_EXPORTS = frozenset(

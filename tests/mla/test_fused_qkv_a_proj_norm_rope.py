@@ -55,8 +55,25 @@ def _requires_sm100_family() -> None:
         pytest.skip("SM100 or SM103 is required")
 
 
+def test_prepare_qkv_a_proj_weight() -> None:
+    _requires_sm100_family()
+    torch.manual_seed(7)
+    weight = torch.randn((2112, 7168), device="cuda", dtype=torch.bfloat16)
+    packed = flashinfer.prepare_qkv_a_proj_weight(weight)
+    expected = weight.view(2112, 56, 128).permute(1, 0, 2)
+
+    assert packed.shape == (56, 2176, 128)
+    assert packed.is_contiguous()
+    torch.testing.assert_close(packed[:, :2112], expected, rtol=0, atol=0)
+    assert torch.count_nonzero(packed[:, 2112:]).item() == 0
+
+
 @pytest.mark.parametrize("cache_dtype", (torch.bfloat16, torch.float32))
-def test_fused_qkv_a_proj_norm_rope(cache_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("packed_weight", (False, True))
+def test_fused_qkv_a_proj_norm_rope(
+    cache_dtype: torch.dtype,
+    packed_weight: bool,
+) -> None:
     _requires_sm100_family()
     torch.manual_seed(7)
     device = torch.device("cuda")
@@ -68,9 +85,14 @@ def test_fused_qkv_a_proj_norm_rope(cache_dtype: torch.dtype) -> None:
     cos_sin_cache = torch.randn((256, 64), device=device, dtype=cache_dtype)
     eps = 1e-6
 
+    operator_weight = (
+        flashinfer.prepare_qkv_a_proj_weight(qkv_a_weight)
+        if packed_weight
+        else qkv_a_weight
+    )
     actual = flashinfer.fused_qkv_a_proj_norm_rope(
         hidden_states,
-        qkv_a_weight,
+        operator_weight,
         q_norm_weight,
         kv_norm_weight,
         positions,

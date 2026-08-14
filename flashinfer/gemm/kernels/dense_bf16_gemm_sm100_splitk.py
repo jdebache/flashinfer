@@ -31,6 +31,10 @@ _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 #: K extent of one CTA tile.
 _CTA_K = 128
 
+#: Static packed projection dimensions.
+_PACKED_WEIGHT_K_BLOCKS = 56
+_PACKED_WEIGHT_N = 2176
+
 #: Kernel-M tiles; 64 increases CTA count for low-M decode shapes.
 _SUPPORTED_MMA_M = (64, 128)
 
@@ -79,7 +83,6 @@ class SplitKTactic:
     split_k: int
     ab_stages: int
     use_2cta: bool = False
-    multicast_a: bool = False
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -148,8 +151,6 @@ def validate_tactic(
         raise ValueError(f"unsupported mma_n={tactic.mma_n}")
     if tactic.use_2cta and (tactic.mma_m != 64 or tactic.mma_n % 16):
         raise ValueError("2-CTA tactics require mma_m=64 and mma_n divisible by 16")
-    if tactic.multicast_a and (m, tactic.mma_n) != (96, 48):
-        raise ValueError("weight multicast currently requires M=96 and mma_n=48")
     if tactic.split_k not in _SUPPORTED_SPLIT_K:
         raise ValueError(f"unsupported split_k={tactic.split_k}")
     if not _MIN_AB_STAGES <= tactic.ab_stages <= _MAX_AB_STAGES:
@@ -261,7 +262,9 @@ __all__ = [
     "SplitKTactic",
     "autotune_tactics",
     "default_tactic",
+    "prepare_packed_weight",
     "run_splitk_dense",
+    "run_splitk_dense_packed_weight",
 ]
 
 
@@ -340,6 +343,7 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        packed_weight: bool = False,
     ) -> None:
         self.acc_dtype = cutlass.Float32
         self.cta_m = tactic.mma_m
@@ -350,7 +354,7 @@ class SplitKDenseGemmKernel:
         self.use_pdl = use_pdl
         self.has_bias = has_bias
         self.use_2cta = tactic.use_2cta
-        self.multicast_a = tactic.multicast_a
+        self.packed_weight = packed_weight
 
         self.threads_per_cta = 256
         self.epilog_threads = 128
@@ -361,23 +365,14 @@ class SplitKDenseGemmKernel:
         self.cta_group = (
             tcgen05.CtaGroup.TWO if tactic.use_2cta else tcgen05.CtaGroup.ONE
         )
-        self.tma_op_a = (
-            cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM_MULTICAST
-            if tactic.use_2cta and tactic.multicast_a
-            else cute_ext.OperationTypeEnum.SM90_TMA_LOAD_MULTICAST
-            if tactic.multicast_a
-            else cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
-            if tactic.use_2cta
-            else cute_ext.OperationTypeEnum.SM90_TMA_LOAD
-        )
-        self.tma_op_b = (
+        self.tma_op = (
             cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
             if tactic.use_2cta
             else cute_ext.OperationTypeEnum.SM90_TMA_LOAD
         )
         self.cluster_shape_vmnk = (
             2 if tactic.use_2cta else 1,
-            2 if tactic.multicast_a else 1,
+            1,
             tactic.split_k,
         )
         self.cluster_shape = (
@@ -451,21 +446,14 @@ class SplitKDenseGemmKernel:
         bidx = block_idx[0]
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         mma_ctas = 2 if self.use_2cta else 1
-        token_ctas = 2 if self.multicast_a else 1
-        token_rank = (cta_rank // mma_ctas) % token_ctas
-        split_rank = cta_rank // (mma_ctas * token_ctas)
+        split_rank = cta_rank // mma_ctas
         output_rank = cta_rank % mma_ctas
         leader_rank = cta_rank - output_rank
-        owner_rank = output_rank + token_rank * mma_ctas
+        owner_rank = output_rank
         is_leader = output_rank == 0
-        n_idx = block_idx[1] % token_ctas
+        n_idx = block_idx[1] // self.split_k
         l_idx = 0
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
-        cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_vmnk),
-            (tiled_mma.thr_id.shape,),
-        )
 
         sA = cute_ext.allocate(
             ab_dtype,
@@ -554,34 +542,68 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_init(bar_reduce, 1)
 
         cute.arch.mbarrier_init_fence()
-        if cutlass.const_expr(self.split_k > 1):
+        if cutlass.const_expr(self.split_k > 1 or self.use_2cta):
             # Publish peer barriers before cross-CTA stores.
             cute.arch.cluster_arrive_relaxed()
         else:
             cute.arch.barrier()
 
         # Host validation guarantees an equal, tail-free K partition.
-        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        k_tile_count = (
+            _PACKED_WEIGHT_K_BLOCKS // self.split_k
+            if self.packed_weight
+            else cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        )
         k_tile_start = split_rank * k_tile_count
 
-        if cutlass.const_expr(self.split_k > 1):
+        if cutlass.const_expr(self.split_k > 1 or self.use_2cta):
             cute.arch.cluster_wait()
+
+        if cutlass.const_expr(self.packed_weight):
+            a_cta_v_tensor = cute.make_tensor(
+                mA.iterator,
+                cute.make_layout(
+                    (self.mma_tiler_mn[0], self.cta_k),
+                    stride=(self.cta_k, 1),
+                ),
+            )
+            a_cta_v_map = cute_ext.get_cta_v_map_ab(
+                a_cta_v_tensor,
+                mnk_tiler,
+                tiled_mma,
+                "A",
+            )
+        else:
+            a_cta_v_map = cute_ext.get_cta_v_map_ab(
+                mA,
+                mnk_tiler,
+                tiled_mma,
+                "A",
+            )
 
         # Warp 3 is idle; warps 4-7 run the epilogue.
         if warp_idx == 0:
+            gA_tile = (
+                mA
+                if cutlass.const_expr(self.packed_weight)
+                else cute.local_tile(
+                    mA,
+                    (self.cta_m, self.cta_k),
+                    (bidx, None, l_idx),
+                )
+            )
             self.dma_warp(
                 bar_full,
                 bar_empty,
                 bar_tma_epilog,
-                cute.local_tile(mA, (self.cta_m, self.cta_k), (bidx, None, l_idx)),
+                gA_tile,
                 sA,
-                cute_ext.get_cta_v_map_ab(mA, mnk_tiler, tiled_mma, "A"),
+                a_cta_v_map,
                 k_tile_start,
                 k_tile_count,
                 True,
                 leader_rank,
-                token_rank,
-                cluster_layout_vmnk,
+                bidx,
             )
         elif warp_idx == 1:
             b_tiler_nk = (
@@ -603,8 +625,7 @@ class SplitKDenseGemmKernel:
                 k_tile_count,
                 False,
                 leader_rank,
-                token_rank,
-                cluster_layout_vmnk,
+                n_idx,
             )
         elif warp_idx == 2:
             self.mma_warp(
@@ -653,8 +674,7 @@ class SplitKDenseGemmKernel:
         k_tile_count: cutlass.Int32,
         is_a: cutlass.Constexpr,
         leader_rank: cutlass.Int32,
-        token_rank: cutlass.Int32,
-        cluster_layout_vmnk: cute.Layout,
+        output_tile_idx: cutlass.Int32,
     ):
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
@@ -672,28 +692,28 @@ class SplitKDenseGemmKernel:
                         cute.slice_(s_tile.layout, (None, None, None, 0)),
                     ),
                     peer_cta_rank_in_cluster=(leader_rank if self.use_2cta else None),
+            )
+            if cutlass.const_expr(is_a and self.packed_weight):
+                packed_row_tile = (
+                    (k_tile_start + k_tile)
+                    * (_PACKED_WEIGHT_N // self.cta_m)
+                    + output_tile_idx
                 )
-            if cutlass.const_expr(is_a and self.multicast_a):
-                if token_rank == 0:
-                    cute_ext.tma_load(
-                        g_tile[None, None, k_tile_start + k_tile],
-                        s_tile[None, None, None, stage],
-                        (bar_full + stage).value,
-                        cta_v_map=cta_v_map,
-                        tma_operation_type=self.tma_op_a,
-                        vmnk_layout=cluster_layout_vmnk,
-                        multicast_mode=2,
-                        update_expect_tx=False,
-                    )
+                g_stage = cute.local_tile(
+                    g_tile,
+                    (self.cta_m, self.cta_k),
+                    (packed_row_tile, 0, 0),
+                )
             else:
-                cute_ext.tma_load(
-                    g_tile[None, None, k_tile_start + k_tile],
-                    s_tile[None, None, None, stage],
-                    (bar_full + stage).value,
-                    cta_v_map=cta_v_map,
-                    tma_operation_type=self.tma_op_b,
-                    update_expect_tx=False,
-                )
+                g_stage = g_tile[None, None, k_tile_start + k_tile]
+            cute_ext.tma_load(
+                g_stage,
+                s_tile[None, None, None, stage],
+                (bar_full + stage).value,
+                cta_v_map=cta_v_map,
+                tma_operation_type=self.tma_op,
+                update_expect_tx=False,
+            )
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
@@ -971,6 +991,32 @@ def _bmm_bias(
     )
 
 
+@cute.experimental.jit
+def _bmm_packed_weight_no_bias(
+    gemm_op: cutlass.Constexpr,
+    packed_a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    stream: _cuda.CUstream,
+):
+    packed_a = cute.make_tensor(
+        packed_a.iterator,
+        cute.make_layout(
+            (_PACKED_WEIGHT_K_BLOCKS * _PACKED_WEIGHT_N, _CTA_K, 1),
+            stride=(_CTA_K, 1, 0),
+        ),
+    )
+    b = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0]))
+    c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
+    gemm_op(
+        packed_a,
+        b,
+        c,
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        stream,
+    )
+
+
 def _from_dlpack_dynamic(tensor, leading_dim: int, assumed_align: int = 32):
     return from_dlpack(tensor, assumed_align=assumed_align).mark_layout_dynamic(
         leading_dim=leading_dim
@@ -1056,6 +1102,17 @@ def _to_cute_swap(a, b, out, bias):
     )
 
 
+def _to_cute_packed_weight(a, packed_weight, out):
+    packed = packed_weight.unsqueeze(0)
+    b_swap = a.unsqueeze(0).transpose(-2, -1)
+    c_swap = out.unsqueeze(0).transpose(-2, -1)
+    return (
+        from_dlpack(packed, assumed_align=32),
+        _from_dlpack_dynamic(b_swap, 1),
+        _from_dlpack_dynamic(c_swap, 1),
+    )
+
+
 @functools.cache
 def _get_compiled_splitk_kernel(
     dtype,
@@ -1081,6 +1138,49 @@ def _get_compiled_splitk_kernel(
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
     return compiled
+
+
+@functools.cache
+def _get_compiled_packed_weight_kernel(
+    dtype,
+    tactic: SplitKTactic,
+):
+    if dtype not in _SUPPORTED_TORCH_DTYPES:
+        raise ValueError(
+            f"packed split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}"
+        )
+
+    kernel = SplitKDenseGemmKernel(
+        tactic=tactic,
+        use_pdl=False,
+        has_bias=False,
+        packed_weight=True,
+    )
+    packed_repr = from_dlpack(
+        _torch.empty(
+            (1, _PACKED_WEIGHT_K_BLOCKS, _PACKED_WEIGHT_N, _CTA_K),
+            dtype=dtype,
+            device="cuda",
+        ),
+        assumed_align=32,
+    )
+    b_repr = _from_dlpack_dynamic(
+        _make_layout_tensor((1, _CTA_K, tactic.mma_n), dtype, 1),
+        1,
+    )
+    c_repr = _from_dlpack_dynamic(
+        _make_layout_tensor((1, 128, tactic.mma_n), dtype, 1),
+        1,
+    )
+    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
+    return cute_ext.compile(
+        _bmm_packed_weight_no_bias,
+        kernel,
+        packed_repr,
+        b_repr,
+        c_repr,
+        stream,
+    )
 
 
 def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
@@ -1122,6 +1222,94 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
         )
 
     return m, n, k
+
+
+def prepare_packed_weight(
+    weight: _torch.Tensor,
+    *,
+    padded_n: int | None = None,
+) -> _torch.Tensor:
+    """Pack row-major ``weight[N,K]`` as K-block-major BF16 tiles."""
+    if not isinstance(weight, _torch.Tensor) or weight.ndim != 2:
+        raise ValueError("weight must be a 2D torch tensor")
+    if weight.dtype not in _SUPPORTED_TORCH_DTYPES:
+        raise ValueError(f"weight must have dtype in {_SUPPORTED_TORCH_DTYPES}")
+    if not weight.is_contiguous():
+        raise ValueError("weight must be row-major contiguous")
+
+    n, k = weight.shape
+    if k % _CTA_K:
+        raise ValueError(f"weight K={k} must be divisible by {_CTA_K}")
+    if padded_n is None:
+        padded_n = _align_up(n, 128)
+    if padded_n < n or padded_n % 128:
+        raise ValueError(
+            f"padded_n must be at least {n} and divisible by 128, got {padded_n}"
+        )
+
+    padded = weight.new_zeros((padded_n, k))
+    padded[:n].copy_(weight)
+    return (
+        padded.view(padded_n, k // _CTA_K, _CTA_K)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+
+
+def run_splitk_dense_packed_weight(
+    a: _torch.Tensor,
+    packed_weight: _torch.Tensor,
+    out: _torch.Tensor,
+    tactic: SplitKTactic,
+) -> _torch.Tensor:
+    """Run ``A[M,K] @ W[N,K].T`` with a prepacked static weight."""
+    tensors = (a, packed_weight, out)
+    if any(not isinstance(tensor, _torch.Tensor) for tensor in tensors):
+        raise ValueError("a, packed_weight, and out must be torch tensors")
+    if a.ndim != 2 or packed_weight.ndim != 3 or out.ndim != 2:
+        raise ValueError("expected a[M,K], packed_weight[K/128,N_pad,128], out[M,N]")
+    if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors):
+        raise ValueError("all tensors must be on the same CUDA device")
+    if a.dtype not in _SUPPORTED_TORCH_DTYPES or any(
+        tensor.dtype != a.dtype for tensor in (a, packed_weight, out)
+    ):
+        raise ValueError("a, packed_weight, and out must share BF16 or FP16 dtype")
+    if (
+        not a.is_contiguous()
+        or not packed_weight.is_contiguous()
+        or not out.is_contiguous()
+    ):
+        raise ValueError("a, packed_weight, and out must be contiguous")
+    if any(tensor.data_ptr() % 32 for tensor in (a, packed_weight, out)):
+        raise ValueError("a, packed_weight, and out must be 32-byte aligned")
+
+    m, k = a.shape
+    k_blocks, padded_n, k_inner = packed_weight.shape
+    if (k_blocks, padded_n, k_inner) != (
+        _PACKED_WEIGHT_K_BLOCKS,
+        _PACKED_WEIGHT_N,
+        _CTA_K,
+    ):
+        raise ValueError(
+            "packed_weight must have the exact shape (56, 2176, 128), "
+            f"got {tuple(packed_weight.shape)}"
+        )
+    if k_inner != _CTA_K or k_blocks * k_inner != k:
+        raise ValueError(
+            f"packed weight shape {tuple(packed_weight.shape)} is incompatible with K={k}"
+        )
+    n = out.shape[1]
+    if out.shape[0] != m or n > padded_n:
+        raise ValueError(
+            f"out shape {tuple(out.shape)} must be [M,N] with M={m} and N <= {padded_n}"
+        )
+    validate_tactic(tactic, m, n, k)
+
+    cute_tensors = _to_cute_packed_weight(a, packed_weight, out)
+    compiled = _get_compiled_packed_weight_kernel(a.dtype, tactic)
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(*cute_tensors, stream)
+    return out
 
 
 def run_splitk_dense(

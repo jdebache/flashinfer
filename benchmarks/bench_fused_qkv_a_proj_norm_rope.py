@@ -94,6 +94,7 @@ def benchmark(iterations: int = 200) -> tuple[BenchmarkResult, ...]:
     device = torch.device("cuda")
     hidden_states = torch.randn((96, 7168), device=device, dtype=torch.bfloat16) / 8
     qkv_a_weight = torch.randn((2112, 7168), device=device, dtype=torch.bfloat16) / 8
+    packed_qkv_a_weight = _projection.prepare_qkv_a_proj_weight(qkv_a_weight)
     q_norm_weight = torch.randn((1536,), device=device, dtype=torch.bfloat16)
     kv_norm_weight = torch.randn((512,), device=device, dtype=torch.bfloat16)
     positions = torch.arange(96, device=device, dtype=torch.int64)
@@ -113,6 +114,26 @@ def benchmark(iterations: int = 200) -> tuple[BenchmarkResult, ...]:
             custom_k,
             hidden_states,
             qkv_a_weight,
+            q_norm_weight,
+            kv_norm_weight,
+            positions,
+            cos_sin_cache,
+            eps,
+        )
+
+    packed_workspace = torch.empty((96, 2112), device=device, dtype=torch.bfloat16)
+    packed_q = torch.empty((96, 1536), device=device, dtype=torch.bfloat16)
+    packed_kv = torch.empty((96, 512), device=device, dtype=torch.bfloat16)
+    packed_k = torch.empty((96, 1, 64), device=device, dtype=torch.bfloat16)
+
+    def packed_call() -> None:
+        _projection._fused_qkv_a_proj_norm_rope_impl(
+            packed_workspace,
+            packed_q,
+            packed_kv,
+            packed_k,
+            hidden_states,
+            packed_qkv_a_weight,
             q_norm_weight,
             kv_norm_weight,
             positions,
@@ -152,7 +173,8 @@ def benchmark(iterations: int = 200) -> tuple[BenchmarkResult, ...]:
         )
 
     graphs = (
-        ("custom_gemm_and_fused_post", _capture(custom_call)),
+        ("custom_row_major_and_post", _capture(custom_call)),
+        ("custom_packed_and_post", _capture(packed_call)),
         ("cublas_and_fused_post", _capture(cublas_post_call)),
         ("pytorch_reference", _capture(reference_call)),
     )

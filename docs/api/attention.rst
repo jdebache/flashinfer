@@ -206,6 +206,15 @@ and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
 .. currentmodule:: flashinfer.mla
 
+DeepSeek-V3 Projection
+----------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_qkv_a_proj_weight
+    fused_qkv_a_proj_norm_rope
+
 PageAttention for MLA
 ---------------------
 
