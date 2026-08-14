@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from ._core import *  # noqa: F401,F403
+from ._projection import fused_qkv_a_proj_norm_rope as fused_qkv_a_proj_norm_rope
 
 
 _PRIMS_TS_LAZY_EXPORTS = frozenset(

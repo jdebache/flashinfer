@@ -111,6 +111,9 @@ from .jit.norm import gen_norm_module
 from .jit.fused_moe_add_residual_rmsnorm import (
     gen_fused_moe_add_residual_rmsnorm_sm100_module,
 )
+from .jit.fused_qkv_a_proj_norm_rope import (
+    gen_fused_qkv_a_proj_norm_rope_sm100_module,
+)
 from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
     select_knobs,
@@ -706,6 +709,7 @@ def gen_all_modules(
         ]
         if has_sm100 or has_sm103:
             jit_specs.append(gen_fused_moe_add_residual_rmsnorm_sm100_module())
+            jit_specs.append(gen_fused_qkv_a_proj_norm_rope_sm100_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:

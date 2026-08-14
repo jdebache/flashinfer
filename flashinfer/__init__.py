@@ -131,6 +131,7 @@ from .kda_prefill import (
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
+from .mla import fused_qkv_a_proj_norm_rope as fused_qkv_a_proj_norm_rope
 from . import mhc as mhc
 from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm

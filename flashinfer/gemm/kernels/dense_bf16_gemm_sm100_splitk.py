@@ -35,13 +35,16 @@ _CTA_K = 128
 _SUPPORTED_MMA_M = (64, 128)
 
 #: Kernel-N carries public M, which is limited to 32.
-_SUPPORTED_MMA_N = (8, 16, 32)
+_SUPPORTED_MMA_N = (8, 16, 32, 48, 96)
 
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
 _SUPPORTED_SPLIT_K = (1, 2, 3, 4)
 
-#: Largest public M this low-M policy serves.
+#: Largest public M served by the generic low-M policy.
 _MAX_M = 32
+
+#: Exact larger public-M specializations used by fused operators.
+_EXACT_PUBLIC_M_MMA_N = ((96, 48), (96, 96))
 
 #: Bytes per FP32 partial exchanged through DSMEM.
 _FP32_BYTES = 4
@@ -75,6 +78,8 @@ class SplitKTactic:
     mma_n: int
     split_k: int
     ab_stages: int
+    use_2cta: bool = False
+    multicast_a: bool = False
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -86,12 +91,13 @@ def _smem_bytes(
     ab_stages: int,
 ) -> int:
     """Mirror the device allocator's shared-memory layout."""
+    b_rows = tactic.mma_n // 2 if tactic.use_2cta else tactic.mma_n
     cursor = (
         _align_up(
             tactic.mma_m * _CTA_K * _AB_ELEMENT_BYTES * ab_stages,
             _AB_BUFFER_ALIGN_BYTES,
         )
-        + tactic.mma_n * _CTA_K * _AB_ELEMENT_BYTES * ab_stages
+        + b_rows * _CTA_K * _AB_ELEMENT_BYTES * ab_stages
     )
 
     cursor = _align_up(cursor, _MBARRIER_BYTES)
@@ -140,6 +146,10 @@ def validate_tactic(
         raise ValueError(f"unsupported mma_m={tactic.mma_m}")
     if tactic.mma_n not in _SUPPORTED_MMA_N:
         raise ValueError(f"unsupported mma_n={tactic.mma_n}")
+    if tactic.use_2cta and (tactic.mma_m != 64 or tactic.mma_n % 16):
+        raise ValueError("2-CTA tactics require mma_m=64 and mma_n divisible by 16")
+    if tactic.multicast_a and (m, tactic.mma_n) != (96, 48):
+        raise ValueError("weight multicast currently requires M=96 and mma_n=48")
     if tactic.split_k not in _SUPPORTED_SPLIT_K:
         raise ValueError(f"unsupported split_k={tactic.split_k}")
     if not _MIN_AB_STAGES <= tactic.ab_stages <= _MAX_AB_STAGES:
@@ -147,8 +157,13 @@ def validate_tactic(
             f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], "
             f"got {tactic.ab_stages}"
         )
-    if not 1 <= m <= _MAX_M:
-        raise ValueError(f"this low-M policy requires 1 <= M <= {_MAX_M}, got {m}")
+    supports_exact_m = (m, tactic.mma_n) in _EXACT_PUBLIC_M_MMA_N
+    if not (1 <= m <= _MAX_M or supports_exact_m):
+        raise ValueError(
+            f"this policy requires 1 <= M <= {_MAX_M} or an exact "
+            f"(M, mma_n) specialization in {_EXACT_PUBLIC_M_MMA_N}, got "
+            f"(M, mma_n)=({m}, {tactic.mma_n})"
+        )
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
     if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
@@ -334,13 +349,42 @@ class SplitKDenseGemmKernel:
         self.split_k = tactic.split_k
         self.use_pdl = use_pdl
         self.has_bias = has_bias
+        self.use_2cta = tactic.use_2cta
+        self.multicast_a = tactic.multicast_a
 
         self.threads_per_cta = 256
         self.epilog_threads = 128
-        self.mma_tiler_mn = (tactic.mma_m, tactic.mma_n)
-        self.cta_group = tcgen05.CtaGroup.ONE
-        self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
-        self.cluster_shape = (1, tactic.split_k, 1)
+        self.mma_tiler_mn = (
+            tactic.mma_m * (2 if tactic.use_2cta else 1),
+            tactic.mma_n,
+        )
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if tactic.use_2cta else tcgen05.CtaGroup.ONE
+        )
+        self.tma_op_a = (
+            cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM_MULTICAST
+            if tactic.use_2cta and tactic.multicast_a
+            else cute_ext.OperationTypeEnum.SM90_TMA_LOAD_MULTICAST
+            if tactic.multicast_a
+            else cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
+            if tactic.use_2cta
+            else cute_ext.OperationTypeEnum.SM90_TMA_LOAD
+        )
+        self.tma_op_b = (
+            cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
+            if tactic.use_2cta
+            else cute_ext.OperationTypeEnum.SM90_TMA_LOAD
+        )
+        self.cluster_shape_vmnk = (
+            2 if tactic.use_2cta else 1,
+            2 if tactic.multicast_a else 1,
+            tactic.split_k,
+        )
+        self.cluster_shape = (
+            self.cluster_shape_vmnk[0],
+            self.cluster_shape_vmnk[1] * self.cluster_shape_vmnk[2],
+            1,
+        )
 
         values_per_thread = (tactic.mma_m * tactic.mma_n) // self.epilog_threads
         if values_per_thread % 4:
@@ -363,13 +407,16 @@ class SplitKDenseGemmKernel:
         bias: cute.Tensor,
         stream: _cuda.CUstream,
     ):
-        # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
-            grid=(
+        grid = cute.round_up(
+            (
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
-                c.layout.shape[2],
+                1,
             ),
+            self.cluster_shape,
+        )
+        self.kernel(a, b, c, bias).launch(
+            grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
             smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
@@ -402,10 +449,23 @@ class SplitKDenseGemmKernel:
         mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
         block_idx = cute.arch.block_idx()
         bidx = block_idx[0]
-        split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        n_idx = block_idx[1] // self.split_k
-        l_idx = block_idx[2]
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        mma_ctas = 2 if self.use_2cta else 1
+        token_ctas = 2 if self.multicast_a else 1
+        token_rank = (cta_rank // mma_ctas) % token_ctas
+        split_rank = cta_rank // (mma_ctas * token_ctas)
+        output_rank = cta_rank % mma_ctas
+        leader_rank = cta_rank - output_rank
+        owner_rank = output_rank + token_rank * mma_ctas
+        is_leader = output_rank == 0
+        n_idx = block_idx[1] % token_ctas
+        l_idx = 0
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_vmnk),
+            (tiled_mma.thr_id.shape,),
+        )
 
         sA = cute_ext.allocate(
             ab_dtype,
@@ -483,7 +543,7 @@ class SplitKDenseGemmKernel:
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(stages):
-                    cute.arch.mbarrier_init(bar_full + i, 2)
+                    cute.arch.mbarrier_init(bar_full + i, 2 * mma_ctas)
                     cute.arch.mbarrier_init(bar_empty + i, 1)
                 cute.arch.mbarrier_init(bar_tma_epilog, 32)
                 cute.arch.mbarrier_init(bar_mma_epilog, 1)
@@ -519,18 +579,32 @@ class SplitKDenseGemmKernel:
                 k_tile_start,
                 k_tile_count,
                 True,
+                leader_rank,
+                token_rank,
+                cluster_layout_vmnk,
             )
         elif warp_idx == 1:
+            b_tiler_nk = (
+                self.cta_n // mma_ctas,
+                self.cta_k,
+            )
             self.dma_warp(
                 bar_full,
                 bar_empty,
                 bar_tma_epilog,
-                cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx)),
+                cute.local_tile(
+                    mB,
+                    b_tiler_nk,
+                    (n_idx * mma_ctas + output_rank, None, l_idx),
+                ),
                 sB,
                 cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B"),
                 k_tile_start,
                 k_tile_count,
                 False,
+                leader_rank,
+                token_rank,
+                cluster_layout_vmnk,
             )
         elif warp_idx == 2:
             self.mma_warp(
@@ -545,6 +619,8 @@ class SplitKDenseGemmKernel:
                 acc_layout,
                 self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2]),
                 k_tile_count,
+                is_leader,
+                leader_rank,
             )
         elif warp_idx >= 4:
             self.epilog_warp(
@@ -561,6 +637,7 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                owner_rank,
             )
 
     @cute.experimental.jit
@@ -575,6 +652,9 @@ class SplitKDenseGemmKernel:
         k_tile_start: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         is_a: cutlass.Constexpr,
+        leader_rank: cutlass.Int32,
+        token_rank: cutlass.Int32,
+        cluster_layout_vmnk: cute.Layout,
     ):
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
@@ -591,15 +671,29 @@ class SplitKDenseGemmKernel:
                         s_tile.element_type,
                         cute.slice_(s_tile.layout, (None, None, None, 0)),
                     ),
+                    peer_cta_rank_in_cluster=(leader_rank if self.use_2cta else None),
                 )
-            cute_ext.tma_load(
-                g_tile[None, None, k_tile_start + k_tile],
-                s_tile[None, None, None, stage],
-                (bar_full + stage).value,
-                cta_v_map=cta_v_map,
-                tma_operation_type=self.tma_op,
-                update_expect_tx=False,
-            )
+            if cutlass.const_expr(is_a and self.multicast_a):
+                if token_rank == 0:
+                    cute_ext.tma_load(
+                        g_tile[None, None, k_tile_start + k_tile],
+                        s_tile[None, None, None, stage],
+                        (bar_full + stage).value,
+                        cta_v_map=cta_v_map,
+                        tma_operation_type=self.tma_op_a,
+                        vmnk_layout=cluster_layout_vmnk,
+                        multicast_mode=2,
+                        update_expect_tx=False,
+                    )
+            else:
+                cute_ext.tma_load(
+                    g_tile[None, None, k_tile_start + k_tile],
+                    s_tile[None, None, None, stage],
+                    (bar_full + stage).value,
+                    cta_v_map=cta_v_map,
+                    tma_operation_type=self.tma_op_b,
+                    update_expect_tx=False,
+                )
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
@@ -637,40 +731,60 @@ class SplitKDenseGemmKernel:
         acc_layout: cutlass.Constexpr,
         mma_inst_tile_k: cutlass.Constexpr,
         k_tile_count: cutlass.Int32,
+        is_leader: cutlass.Boolean,
+        leader_rank: cutlass.Int32,
     ):
         num_tmem_cols = 256
-        cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=False)
+        cute.arch.alloc_tmem(
+            num_tmem_cols,
+            tmem_base_ptr,
+            is_two_cta=self.use_2cta,
+        )
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
-        cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
+        cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
         tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
         accumulator = cute.make_tensor(tmem_ptr, acc_layout)[None, None, None, 0]
-        mma_atom = cute.make_mma_atom(tiled_mma.op)
-        full_phase = cutlass.Int32(0)
-        for k_tile in cutlass.range(k_tile_count, unroll=1):
-            stage = k_tile % self.num_ab_stage
-            cute.arch.mbarrier_wait(bar_full + stage, full_phase)
-            for k_block in range(mma_inst_tile_k):
-                if k_block == 0:
-                    mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                else:
-                    mma_atom.set(tcgen05.Field.ACCUMULATE, True)
-                cute_ext.dot(
-                    mma_atom,
-                    cute.append_ones(sA[None, None, k_block, stage], up_to_rank=3),
-                    cute.append_ones(sB[None, None, k_block, stage], up_to_rank=3),
-                    accumulator,
-                )
-            with cute.arch.elect_one():
-                tcgen05.commit(bar_empty + stage, None, self.cta_group)
-            if stage == self.num_ab_stage - 1:
-                full_phase = full_phase ^ 1
+        if is_leader:
+            mma_atom = cute.make_mma_atom(tiled_mma.op)
+            commit_mask = (cutlass.Int32(3) << leader_rank) if self.use_2cta else None
+            full_phase = cutlass.Int32(0)
+            for k_tile in cutlass.range(k_tile_count, unroll=1):
+                stage = k_tile % self.num_ab_stage
+                cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+                for k_block in range(mma_inst_tile_k):
+                    if k_block == 0:
+                        mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                    else:
+                        mma_atom.set(tcgen05.Field.ACCUMULATE, True)
+                    cute_ext.dot(
+                        mma_atom,
+                        cute.append_ones(sA[None, None, k_block, stage], up_to_rank=3),
+                        cute.append_ones(sB[None, None, k_block, stage], up_to_rank=3),
+                        accumulator,
+                    )
+                with cute.arch.elect_one():
+                    tcgen05.commit(
+                        bar_empty + stage,
+                        commit_mask,
+                        self.cta_group,
+                    )
+                if stage == self.num_ab_stage - 1:
+                    full_phase = full_phase ^ 1
 
-        with cute.arch.elect_one():
-            tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+            with cute.arch.elect_one():
+                tcgen05.commit(
+                    bar_mma_epilog,
+                    commit_mask,
+                    self.cta_group,
+                )
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
-        cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
+        cute.arch.dealloc_tmem(
+            tmem_ptr,
+            num_tmem_cols,
+            is_two_cta=self.use_2cta,
+        )
 
     @cute.experimental.jit
     def epilog_warp(
@@ -688,6 +802,7 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        owner_rank: cutlass.Int32,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -706,7 +821,7 @@ class SplitKDenseGemmKernel:
                 c_dtype,
                 self.acc_dtype,
                 epi_tile,
-                False,
+                self.use_2cta,
             ),
             acc_view,
         )
@@ -771,6 +886,7 @@ class SplitKDenseGemmKernel:
             )
             if split_rank != OWNER_RANK:
                 for value_idx in cutlass.range_constexpr(0, values_per_thread, 4):
+                    value_group = cutlass.const_expr(value_idx // 4)
                     _store_shared_remote_v4(
                         rAcc[value_idx],
                         rAcc[value_idx + 1],
@@ -778,10 +894,10 @@ class SplitKDenseGemmKernel:
                         rAcc[value_idx + 3],
                         mailbox.iterator
                         + (split_rank - Int32(1)) * values_per_peer
-                        + epi_tid * values_per_thread
-                        + value_idx,
+                        + value_group * self.epilog_threads * 4
+                        + epi_tid * 4,
                         bar_reduce,
-                        Int32(OWNER_RANK),
+                        owner_rank,
                     )
             else:
                 if epi_tid == 0:
@@ -791,12 +907,15 @@ class SplitKDenseGemmKernel:
                 cute.arch.mbarrier_wait(bar_reduce, 0)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
+                        value_group = cutlass.const_expr(value_idx // 4)
+                        value_in_group = cutlass.const_expr(value_idx % 4)
                         rAcc[value_idx] = (
                             rAcc[value_idx]
                             + mailbox[
                                 peer * values_per_peer
-                                + epi_tid * values_per_thread
-                                + value_idx
+                                + value_group * self.epilog_threads * 4
+                                + epi_tid * 4
+                                + value_in_group
                             ]
                         )
 

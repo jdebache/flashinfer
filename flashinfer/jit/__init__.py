@@ -97,6 +97,9 @@ from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .fused_moe_add_residual_rmsnorm import (
     gen_fused_moe_add_residual_rmsnorm_sm100_module as gen_fused_moe_add_residual_rmsnorm_sm100_module,
 )
+from .fused_qkv_a_proj_norm_rope import (
+    gen_fused_qkv_a_proj_norm_rope_sm100_module as gen_fused_qkv_a_proj_norm_rope_sm100_module,
+)
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
