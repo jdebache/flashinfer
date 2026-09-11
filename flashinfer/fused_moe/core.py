@@ -2130,6 +2130,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         f"[Autotuner]: Failed to get valid tactics for {instance_key}. Error occurred: {e}"
                     )
                     return []
+                # Diagnostics changes.
+                _EXCLUDED_TILE_TOKENS_DIM = (192, 256)
+                valid_tactics = [
+                    t
+                    for t in valid_tactics
+                    if int(t[0]) not in _EXCLUDED_TILE_TOKENS_DIM
+                ]
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
             return MoERunner.valid_tactics_dict[instance_key]
 

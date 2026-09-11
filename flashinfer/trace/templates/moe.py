@@ -3749,7 +3749,8 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "output": Tensor(
             ["num_tokens", "hidden_size"],
             dtype="bfloat16",
-            description="MoE output.",
+            param="moe_output",
+            description="MoE output, optionally written to caller-provided storage.",
         ),
     },
     tags=["status:experimental", "backend:cute-dsl", "quantization:block-scaled"],

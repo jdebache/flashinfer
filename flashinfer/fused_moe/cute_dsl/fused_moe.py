@@ -519,7 +519,10 @@ def _moe_core_impl(
             enable_pdl=enable_pdl,
         )
 
-    return moe_output[:num_tokens]
+    # ``moe_output`` is guaranteed above to have exactly ``num_tokens`` rows.
+    # Return the buffer itself so callers that supply storage can rely on
+    # object identity in addition to the in-place write contract.
+    return moe_output
 
 
 # =============================================================================
@@ -879,6 +882,7 @@ class CuteDslMoEWrapper:
         tactic: Optional[Tuple] = None,
         *,
         per_token_scale: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL fused-MoE forward pass.
 
@@ -918,7 +922,13 @@ class CuteDslMoEWrapper:
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
         per_token_scale : Optional[torch.Tensor]
-            Optional W4A4 per-token input row scale for GEMM1.
+            Per-token input row scale for GEMM1. Passing this enables the
+            per-token activation path.
+        moe_output : Optional[torch.Tensor]
+            Pre-allocated output buffer of shape
+            ``[num_tokens, hidden_size]``. The result is written in place and
+            the same tensor object is returned. Allocated internally if
+            ``None``.
 
         Returns
         -------
@@ -937,11 +947,12 @@ class CuteDslMoEWrapper:
         if self.quant_mode == "w4a4" and x.dtype is not torch.uint8:
             raise TypeError("quant_mode='w4a4' requires packed uint8 input")
 
-        moe_output = torch.empty(
-            (num_tokens, self.hidden_size),
-            dtype=self.output_dtype,
-            device=x.device,
-        )
+        if moe_output is None:
+            moe_output = torch.empty(
+                (num_tokens, self.hidden_size),
+                dtype=self.output_dtype,
+                device=x.device,
+            )
 
         # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
