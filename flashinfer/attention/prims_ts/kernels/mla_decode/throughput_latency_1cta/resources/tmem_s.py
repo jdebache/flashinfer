@@ -73,7 +73,7 @@ from ...helpers.math import (
     smem_atomic_max_u32,
     u32_to_float_for_atomic_max,
 )
-from ...helpers.mask import MaskType
+from ...helpers.mask import MaskType, page_token_shift
 from ...helpers.ops import (
     float_to_u32_bits,
     freeze_smem_descriptor,
@@ -100,6 +100,20 @@ from .common import (
 # =====================================================================
 # TmemSResource — S scores in TMEM, UmmaProducerAsync pipeline
 # =====================================================================
+
+
+@cute.jit
+def _shifted_key(cfg, seq_len_kv, tile_offset_k, col):
+    """Return ``(is_zero_fill, key_pos)`` for score column ``col`` of the tile.
+
+    The loaders shift each page by :func:`page_token_shift` rows, so smem row
+    ``r`` of a page holds key ``page_start + r - shift`` and rows
+    ``r < shift`` are TMA zero-fill that must never contribute.
+    """
+    page_size = cfg.num_tokens_per_page
+    page_col = (col // Int32(page_size)) * Int32(page_size)
+    shift = page_token_shift(seq_len_kv, tile_offset_k + page_col, page_size)
+    return col < page_col + shift, tile_offset_k + col - shift
 
 
 @dataclass(kw_only=True)
@@ -530,8 +544,10 @@ class TmemSResource(MlaResource):
                         self.cu_seqlens_q,
                     )
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
-                    token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
-                    if token_idx >= row_seq_len_kv:
+                    zero_fill, key_pos = _shifted_key(
+                        cfg, seq_len_kv, tile_offset_k, local_col_base + Int32(reg_idx)
+                    )
+                    if zero_fill | (key_pos >= row_seq_len_kv):
                         s_vals[reg_idx] = neg_max_f32()
             else:
                 local_idx_k0 = warp_idx * Int32(WARP_LANES) + (
@@ -570,36 +586,23 @@ class TmemSResource(MlaResource):
                         )
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base
-                    token_idx = tile_offset_k + local_idx_k0
-                    if token_idx >= seq_len_kv_0:
-                        s_vals[s_base + 0] = neg_max_f32()
-                    if token_idx >= seq_len_kv_1:
-                        s_vals[s_base + 1] = neg_max_f32()
-                    token_idx = (
-                        tile_offset_k + local_idx_k0 + Int32(SCORE_TOKENS_PER_QK_GROUP)
-                    )
-                    if token_idx >= seq_len_kv_0:
-                        s_vals[s_base + 2] = neg_max_f32()
-                    if token_idx >= seq_len_kv_1:
-                        s_vals[s_base + 3] = neg_max_f32()
-                    token_idx = (
-                        tile_offset_k
-                        + local_idx_k0
-                        + Int32(2 * SCORE_TOKENS_PER_QK_GROUP)
-                    )
-                    if token_idx >= seq_len_kv_0:
-                        s_vals[s_second_panel_base + 0] = neg_max_f32()
-                    if token_idx >= seq_len_kv_1:
-                        s_vals[s_second_panel_base + 1] = neg_max_f32()
-                    token_idx = (
-                        tile_offset_k
-                        + local_idx_k0
-                        + Int32(3 * SCORE_TOKENS_PER_QK_GROUP)
-                    )
-                    if token_idx >= seq_len_kv_0:
-                        s_vals[s_second_panel_base + 2] = neg_max_f32()
-                    if token_idx >= seq_len_kv_1:
-                        s_vals[s_second_panel_base + 3] = neg_max_f32()
+                    for token_group in cutlass.range_constexpr(4):
+                        zero_fill, key_pos = _shifted_key(
+                            cfg,
+                            seq_len_kv,
+                            tile_offset_k,
+                            local_idx_k0
+                            + Int32(token_group * SCORE_TOKENS_PER_QK_GROUP),
+                        )
+                        pair_base = (
+                            s_base + 2 * token_group
+                            if token_group < 2
+                            else s_second_panel_base + 2 * (token_group - 2)
+                        )
+                        if zero_fill | (key_pos >= seq_len_kv_0):
+                            s_vals[pair_base + 0] = neg_max_f32()
+                        if zero_fill | (key_pos >= seq_len_kv_1):
+                            s_vals[pair_base + 1] = neg_max_f32()
 
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
             # Keeps-MMA-AB keeps the softmax state in scratch words indexed by

@@ -1290,6 +1290,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
+                        K=cache_seqs[blk_coord[2]],
                         local_split_kv=local_split_kv,
                         q_begin=q_begin,
                         load_q_pipeline=load_q_pipeline,
@@ -2107,35 +2108,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         )
         tSgQL = thr_mma_qk.partition_A(gQL)
         tSgQR = thr_mma_qk.partition_A(gQR)
-        cta_m = min(
-            qk_params.tiled_mma_qk.op.shape_mnk[0]
-            // qk_params.tiled_mma_qk.thr_id.shape,
-            self.page_size,
-        )
-        page_tile_size = min(self.page_size, cta_m)
-        gCL = cute.tiled_divide(qk_params.mCL, (page_tile_size, self.mma_qk_tiler[2]))
-        tSgCL = (
-            gCL[
-                None,
-                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
-                None,
-                None,
-            ]
-            if cta_m < self.page_size
-            else gCL[None, 0, None, None]
-        )
-        gKR = cute.tiled_divide(qk_params.mKR, (page_tile_size, self.mma_qk_tiler[2]))
-        tSgKR = (
-            gKR[
-                None,
-                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
-                None,
-                None,
-            ]
-            if cta_m < self.page_size
-            else gKR[None, 0, None, None]
-        )
-
         # tma partition for q, k latent/rope
         # smem: ((atom_v, rest_v), STAGE)
         # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
@@ -2154,20 +2126,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             cute.group_modes(qk_params.sQ_rope, 0, 3),
             cute.group_modes(tSgQR, 0, 3),
         )
-        tKCsKC, tCLgCL = cpasync.tma_partition(
+        # The K/V cache gmem partitions are rebuilt per page by the per-tile
+        # loaders with that page's token shift; only the smem side is fixed.
+        tKCsKC, _ = self._k_cache_tma_partition(
+            common_params,
+            qk_params,
+            qk_params.mCL,
             qk_params.tma_atom_c_latent,
-            0,
-            cute.make_layout(1),
-            qk_params.sKC,
-            tSgCL,
-        )
-
-        _, tKRgKR = cpasync.tma_partition(
-            qk_params.tma_atom_c_rope,
-            0,
-            cute.make_layout(1),
-            qk_params.sKC,
-            tSgKR,
+            cutlass.Int32(0),
         )
 
         if cutlass.const_expr(self.is_var_q):
@@ -2188,37 +2154,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 common_params.blk_coord[2],
             ]
 
-        # Flatten divide and partition global tensors for V TMA load
-        page_tile_size = min(self.page_size, self.mma_pv_tiler[2])
-        gCLT = cute.flat_divide(v_params.mCLT, (self.mma_pv_tiler[1], page_tile_size))
-        cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
-        gCLT = cute.logical_divide(gCLT, (cta_n,))[
-            (None, common_params.blk_coord[0]), None, None, None, None
-        ]
-        tOgCLT = cute.tiled_divide(gCLT, (cta_n, page_tile_size))
-        tOgCLT = tOgCLT[None, 0, 0, None, None, None]
-
-        # tma partition for vc
-        # smem: ((atom_v, rest_v), STAGE)
-        # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
-        tVCsVC, tCLTgCLT = cpasync.tma_partition(
-            v_params.tma_atom_c_latent_transpose,
-            0,
-            cute.make_layout(1),
-            v_params.sVC,
-            tOgCLT,
+        tVCsVC, _ = self._v_cache_tma_partition(
+            common_params, v_params, cutlass.Int32(0)
         )
 
         # set extra params
         common_params.mPT = mPT
         qk_params.tQLgQL = tQLgQL
         qk_params.tQRgQR = tQRgQR
-        qk_params.tCLgCL = tCLgCL
-        qk_params.tKRgKR = tKRgKR
         qk_params.tQsQ = tQsQ
         qk_params.tQsQ_rope = tQsQ_rope
         qk_params.tKCsKC = tKCsKC
-        v_params.tCLTgCLT = tCLTgCLT
         v_params.tVCsVC = tVCsVC
 
         load_q_producer_state, load_kv_producer_state, load_pt_consumer_state = (
@@ -2271,6 +2217,84 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             load_kv_producer_state,
             load_pt_consumer_state,
             load_pt_release_state,
+        )
+
+    @cute.jit
+    def _page_token_shift(self, K: cutlass.Int32, page_start) -> cutlass.Int32:
+        """Number of leading smem rows of a page that TMA zero-fills.
+
+        Each page's TMA token coordinate is moved back by this amount so that
+        the slots at or past ``K`` are never inside a TMA box: 0 for a fully
+        valid page, ``page_size`` for a page entirely past ``K``.  This keeps
+        NaN/Inf in unused cache slots out of the P·V MMA (0 * NaN = NaN).
+        """
+        valid_tokens = cutlass.min(
+            cutlass.max(K - page_start, cutlass.Int32(0)),
+            cutlass.Int32(self.page_size),
+        )
+        return cutlass.Int32(self.page_size) - valid_tokens
+
+    @cute.jit
+    def _k_cache_tma_partition(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        mC: cute.Tensor,
+        tma_atom: cute.CopyAtom,
+        token_shift: cutlass.Int32,
+    ) -> tuple[cute.Tensor, cute.Tensor]:
+        """TMA-partition a K-side cache view (latent or rope) shifted by ``-token_shift``."""
+        mC = cute.domain_offset((cutlass.Int32(0) - token_shift, 0, 0), mC)
+        cta_m = min(
+            qk_params.tiled_mma_qk.op.shape_mnk[0]
+            // qk_params.tiled_mma_qk.thr_id.shape,
+            self.page_size,
+        )
+        page_tile_size = min(self.page_size, cta_m)
+        gC = cute.tiled_divide(mC, (page_tile_size, self.mma_qk_tiler[2]))
+        tSgC = (
+            gC[
+                None,
+                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
+                None,
+                None,
+            ]
+            if cta_m < self.page_size
+            else gC[None, 0, None, None]
+        )
+        return cpasync.tma_partition(
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC,
+            tSgC,
+        )
+
+    @cute.jit
+    def _v_cache_tma_partition(
+        self,
+        common_params: SimpleNamespace,
+        v_params: SimpleNamespace,
+        token_shift: cutlass.Int32,
+    ) -> tuple[cute.Tensor, cute.Tensor]:
+        """TMA-partition the transposed latent (V) cache view shifted by ``-token_shift``."""
+        mCLT = cute.domain_offset((0, cutlass.Int32(0) - token_shift, 0), v_params.mCLT)
+        page_tile_size = min(self.page_size, self.mma_pv_tiler[2])
+        gCLT = cute.flat_divide(mCLT, (self.mma_pv_tiler[1], page_tile_size))
+        cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
+        gCLT = cute.logical_divide(gCLT, (cta_n,))[
+            (None, common_params.blk_coord[0]), None, None, None, None
+        ]
+        tOgCLT = cute.tiled_divide(gCLT, (cta_n, page_tile_size))
+        tOgCLT = tOgCLT[None, 0, 0, None, None, None]
+        # smem: ((atom_v, rest_v), STAGE)
+        # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
+        return cpasync.tma_partition(
+            v_params.tma_atom_c_latent_transpose,
+            0,
+            cute.make_layout(1),
+            v_params.sVC,
+            tOgCLT,
         )
 
     @cute.jit
@@ -2341,14 +2365,35 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         page_table_stage = load_pt_consumer_state.index
         load_pt_consumer_state.advance()
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
+        tCLgCL = []
+        tKRgKR = []
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (
-                common_params.sPT[0, page_table_stage]
-                if self.mma_qk_tiler[1] // self.page_size == 1
-                else common_params.sPT[
-                    i + common_params.blk_coord[0] * page_per_tile, page_table_stage
-                ]
+            if cutlass.const_expr(self.mma_qk_tiler[1] // self.page_size == 1):
+                k_idx[i] = common_params.sPT[0, page_table_stage]
+                page_slot = 0
+            else:
+                page_slot = i + common_params.blk_coord[0] * page_per_tile
+                k_idx[i] = common_params.sPT[page_slot, page_table_stage]
+            token_shift = self._page_token_shift(
+                common_params.K,
+                k_index * self.mma_qk_tiler[1] + page_slot * self.page_size,
             )
+            _, tCLgCL_i = self._k_cache_tma_partition(
+                common_params,
+                qk_params,
+                qk_params.mCL,
+                qk_params.tma_atom_c_latent,
+                token_shift,
+            )
+            _, tKRgKR_i = self._k_cache_tma_partition(
+                common_params,
+                qk_params,
+                qk_params.mKR,
+                qk_params.tma_atom_c_rope,
+                token_shift,
+            )
+            tCLgCL.append(tCLgCL_i)
+            tKRgKR.append(tKRgKR_i)
         # load q once at first iteration
         if cutlass.const_expr(load_q):
             common_params.load_q_pipeline.producer_acquire(load_q_producer_state)
@@ -2372,11 +2417,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # get the mbar ptr from pipeline.
             tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
             load_kv_pipeline.producer_acquire(load_kv_producer_state)
-            for k in cutlass.range(page_per_tile):
+            for k in cutlass.range_constexpr(page_per_tile):
                 # load k latent
                 cute.copy(
                     qk_params.tma_atom_c_latent,
-                    qk_params.tCLgCL[None, i, k_idx[k]],
+                    tCLgCL[k][None, i, k_idx[k]],
                     qk_params.tKCsKC[None, k, 0, load_kv_producer_state.index],
                     tma_bar_ptr=tma_bar_ptr,
                 )
@@ -2386,11 +2431,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # get the mbar ptr from pipeline.
             tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
             load_kv_pipeline.producer_acquire(load_kv_producer_state)
-            for k in cutlass.range(page_per_tile):
+            for k in cutlass.range_constexpr(page_per_tile):
                 # load k rope
                 cute.copy(
                     qk_params.tma_atom_c_rope,
-                    qk_params.tKRgKR[None, i, k_idx[k]],
+                    tKRgKR[k][None, i, k_idx[k]],
                     qk_params.tKCsKC[None, k, 0, load_kv_producer_state.index],
                     tma_bar_ptr=tma_bar_ptr,
                 )
@@ -2435,29 +2480,35 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             )
         common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
         load_pt_release_state.advance()
+        tCLTgCLT = []
+        for p in cutlass.range_constexpr(page_per_tile):
+            token_shift = self._page_token_shift(
+                common_params.K,
+                k_index * self.mma_qk_tiler[1] + p * self.page_size,
+            )
+            _, tCLTgCLT_p = self._v_cache_tma_partition(
+                common_params, v_params, token_shift
+            )
+            tCLTgCLT.append(tCLTgCLT_p)
         load_kv_pipeline = common_params.load_kv_pipeline
         tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
-        for i in cutlass.range(self.iterations_pv_k):
+        subtiles_per_page = ceil_div(self.iterations_pv_k, page_per_tile)
+        for i in cutlass.range_constexpr(self.iterations_pv_k):
             for j in cutlass.range(self.iterations_pv_n):
                 # get the mbar ptr from pipeline.
                 tma_bar_ptr = load_kv_pipeline.producer_get_barrier(
                     load_kv_producer_state
                 )
                 load_kv_pipeline.producer_acquire(load_kv_producer_state)
-                for k in cutlass.range(page_per_subtile):
-                    k_idx_i = k_idx[
-                        k
-                        + i
-                        // ceil_div(self.iterations_pv_k, page_per_tile)
-                        * page_per_subtile
-                    ]
+                for k in cutlass.range_constexpr(page_per_subtile):
+                    page_slot = k + i // subtiles_per_page * page_per_subtile
                     cute.copy(
                         v_params.tma_atom_c_latent_transpose,
-                        v_params.tCLTgCLT[
+                        tCLTgCLT[page_slot][
                             None,
                             j,
-                            i % ceil_div(self.iterations_pv_k, page_per_tile),
-                            k_idx_i,
+                            i % subtiles_per_page,
+                            k_idx[page_slot],
                         ],
                         v_params.tVCsVC[None, 0, k, load_kv_producer_state.index],
                         tma_bar_ptr=tma_bar_ptr,
@@ -3047,6 +3098,58 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         return p_cor_producer_state, row_max_new
 
     @cute.jit
+    def _mask_scores(
+        self,
+        common_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        tTR_rAcc: cute.Tensor,
+        tTR_tS: cute.Tensor,
+        cta_m_rows: int,
+    ) -> None:
+        """Replace the hidden score columns of k-tile ``k_index`` by the mask sentinel.
+
+        The loaders shift each page by ``_page_token_shift`` rows, so smem row
+        ``r`` of a page holds key ``page_start + r - shift`` and rows
+        ``r < shift`` are TMA zero-fill that must never contribute.  A thread's
+        columns are contiguous and page-aligned, so the shift is evaluated once
+        per page-sized column group.
+        """
+        K = common_params.K
+        tile_start = k_index * self.mma_qk_tiler[1]
+        num_cols = cute.size(tTR_rAcc)
+        group = min(self.page_size, num_cols)
+        # Spec-decoding (MTP) causal mask.  A flattened row r corresponds to
+        # q_token=floor(r/H), whose last valid key is K-S_q+q_token.  Avoid the
+        # per-element integer division using the equivalent integer predicate:
+        #
+        #   H * (key_pos - K + S_q) <= r
+        if cutlass.const_expr(self.enable_dcp):
+            key_scale = self.num_heads * self.cp_world
+            threshold_bias = self.num_heads * (
+                common_params.cp_rank
+                - common_params.causal_global
+                + common_params.q_len
+            )
+        else:
+            key_scale = self.num_heads
+            threshold_bias = self.num_heads * (common_params.q_len - K)
+        for g in cutlass.range_constexpr(num_cols // group):
+            page_col = (tTR_tS[g * group][1] // self.page_size) * self.page_size
+            shift = self._page_token_shift(K, tile_start + page_col)
+            first_visible_col = page_col + shift
+            key_base = tile_start - shift
+            for i in cutlass.range_constexpr(g * group, (g + 1) * group):
+                col = tTR_tS[i][1]
+                flat_q_row = (
+                    common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                    + common_params.blk_coord[0] * cta_m_rows
+                    + tTR_tS[i][0]
+                )
+                mask_threshold = key_scale * (key_base + col) + threshold_bias
+                visible = (col >= first_visible_col) & (flat_q_row >= mask_threshold)
+                tTR_rAcc[i] = tTR_rAcc[i] if visible else self.acc_dtype(-1.0e6)
+
+    @cute.jit
     def softmax(
         self,
         common_params: SimpleNamespace,
@@ -3147,36 +3250,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                if apply_mask:
-                    flat_q_row = (
-                        common_params.blk_coord[1] * self.mma_qk_tiler[0]
-                        + common_params.blk_coord[0] * cta_m_rows
-                        + tTR_tS[i][0]
-                    )
-                    key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if cutlass.const_expr(self.enable_dcp):
-                        mask_threshold = self.num_heads * (
-                            self.cp_world * key_pos
-                            + common_params.cp_rank
-                            - common_params.causal_global
-                            + common_params.q_len
-                        )
-                        tTR_rAcc[i] = (
-                            tTR_rAcc[i]
-                            if cute.elem_less(key_pos, common_params.K)
-                            and not cute.elem_less(flat_q_row, mask_threshold)
-                            else self.acc_dtype(-1.0e6)
-                        )
-                    else:
-                        mask_threshold = self.num_heads * (
-                            key_pos - common_params.K + common_params.q_len
-                        )
-                        tTR_rAcc[i] = (
-                            tTR_rAcc[i]
-                            if not cute.elem_less(flat_q_row, mask_threshold)
-                            else self.acc_dtype(-1.0e6)
-                        )
+            if apply_mask:
+                self._mask_scores(common_params, k_index, tTR_rAcc, tTR_tS, cta_m_rows)
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
@@ -3203,35 +3278,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    flat_q_row = (
-                        common_params.blk_coord[1] * self.mma_qk_tiler[0]
-                        + common_params.blk_coord[0] * cta_m_rows
-                        + tTR_tS[i][0]
-                    )
-                    key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if cutlass.const_expr(self.enable_dcp):
-                        mask_threshold = self.num_heads * (
-                            self.cp_world * key_pos
-                            + common_params.cp_rank
-                            - common_params.causal_global
-                            + common_params.q_len
-                        )
-                        tTR_rAcc[i] = (
-                            tTR_rAcc[i]
-                            if cute.elem_less(key_pos, common_params.K)
-                            and not cute.elem_less(flat_q_row, mask_threshold)
-                            else self.acc_dtype(-1.0e6)
-                        )
-                    else:
-                        mask_threshold = self.num_heads * (
-                            key_pos - common_params.K + common_params.q_len
-                        )
-                        tTR_rAcc[i] = (
-                            tTR_rAcc[i]
-                            if not cute.elem_less(flat_q_row, mask_threshold)
-                            else self.acc_dtype(-1.0e6)
-                        )
+                self._mask_scores(common_params, k_index, tTR_rAcc, tTR_tS, cta_m_rows)
                 # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(
                     cute.ReductionOp.MAX, row_max_new, 0

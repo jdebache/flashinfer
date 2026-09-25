@@ -19,6 +19,7 @@ from typing import Any, ClassVar, Optional
 
 from cutlass.experimental import primitives as prims
 from ....tensor_map import transform_ragged_coords
+from ...helpers.mask import page_token_shift
 
 import cutlass
 import cutlass.cute as cute
@@ -871,11 +872,19 @@ class SmemKvResource(MlaResource):
                     page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
                 page_base = Int32(page_frag * first_page_elems)
                 smem_page_offset = page_base
+                # Slots at or past seq_len_kv fall outside the tensor map and
+                # are TMA zero-filled; the score mask applies the same shift.
+                token_coord = Int32(0) - page_token_shift(
+                    seq_len_kv,
+                    tile_idx * Int32(cfg.tile_size_kv)
+                    + Int32(page_frag) * Int32(cfg.num_tokens_per_page),
+                    cfg.num_tokens_per_page,
+                )
                 if prims.elect_sync():
                     prims.cp_async_bulk_tensor_shared_cta_global(
                         stage_base.data_ptr(smem_page_offset),
                         tma_desc,
-                        (dim_offset, Int32(0), page_id),
+                        (dim_offset, token_coord, page_id),
                         stage_info.barrier,
                     )
                 if cutlass.const_expr(active_width > inner_width):
@@ -884,7 +893,7 @@ class SmemKvResource(MlaResource):
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             stage_base.data_ptr(second_half_offset),
                             tma_desc,
-                            (dim_offset + Int32(inner_width), Int32(0), page_id),
+                            (dim_offset + Int32(inner_width), token_coord, page_id),
                             stage_info.barrier,
                         )
                 if cutlass.const_expr(
@@ -900,7 +909,7 @@ class SmemKvResource(MlaResource):
                                 Int32(active_tile_elems) + smem_page_offset
                             ),
                             tma_desc,
-                            (dim_offset, Int32(0), page_id),
+                            (dim_offset, token_coord, page_id),
                             stage_info.barrier,
                         )
             if cutlass.const_expr(uses_compact_fp8_rope_stage):

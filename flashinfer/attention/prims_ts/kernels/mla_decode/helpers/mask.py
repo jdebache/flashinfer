@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mask policy shared by the MLA decode kernels and reference path."""
+"""Mask policy shared by the MLA decode kernels and reference path.
+
+Paged K/V tiles are loaded whole, so the slots of a page at or past the
+request's K length would reach the P·V MMA where ``0 * NaN = NaN``.  The
+loaders instead move each page's TMA token coordinate back by
+:func:`page_token_shift` rows: the slots past K fall outside the tensor map
+and TMA zero-fills them, and smem row ``r`` of a page holds key
+``page_start + r - shift``.  The score mask applies the matching remap.
+"""
 
 from enum import Enum
 
@@ -61,3 +69,17 @@ def mask_visible_k_length(
         seq_len_kv - (safe_seq_len_q - Int32(1) - safe_q_idx),
         Int32(0),
     )
+
+
+@cute.jit
+def page_token_shift(seq_len_kv, page_start, page_size: cutlass.Constexpr[int]):
+    """Return how many leading smem rows of a page are TMA zero-fill.
+
+    0 for a fully valid page, ``page_size`` for a page entirely past
+    ``seq_len_kv``; the page's TMA token coordinate is ``-shift``.
+    """
+    valid_tokens = cute.math.min(
+        cute.math.max(Int32(seq_len_kv) - Int32(page_start), Int32(0)),
+        Int32(page_size),
+    )
+    return Int32(page_size) - valid_tokens
