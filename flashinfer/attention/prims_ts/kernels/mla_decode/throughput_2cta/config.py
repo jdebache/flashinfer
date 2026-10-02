@@ -189,6 +189,14 @@ class MlaDecodeConfig:
     threads_per_cta: int = 384  # 12 warps * 32
     warps_in_n: int = 2
 
+    # Shift each K/V page's TMA token coordinate so slots past the request's
+    # K length fall outside the tensor map (TMA zero-fill) instead of reaching
+    # the P*V MMA as 0 * NaN.  The FP8 split-MMA schedule leaves it off: its
+    # 32-register TMA producers are bound by a serialized page-id-load -> TMA
+    # chain per copy, and the extra uniform-datapath coordinate math measured
+    # +19% at 8k tokens / batch 256 on GB300.  Callers of that schedule must
+    # keep unused cache slots finite.
+    kv_tail_shift: bool = True
     # Register budgets passed to setmaxnreg for the high-register softmax and
     # correction groups; all other warps use the lower shared budget.
     softmax_reg_num: int = 192
@@ -401,6 +409,7 @@ def make_mla_decode_config(
         cfg.softmax_reg_num = 160
         cfg.correction_reg_num = 160
         cfg.other_reg_num = 32
+        cfg.kv_tail_shift = False
         cfg.mma_o_stage = 2
         cfg.epilogue_sync_bar_id = 4
 

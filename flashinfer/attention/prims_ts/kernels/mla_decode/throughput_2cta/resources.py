@@ -105,7 +105,7 @@ from ..helpers.ops import (
     fmax_f32,
     pack_float4_to_fp8_e4m3,
 )
-from ..helpers.mask import MaskType, mask_visible_k_length
+from ..helpers.mask import MaskType, mask_visible_k_length, page_token_shift
 from ..helpers.query import (
     flat_query_row_state,
     query_batch_bounds,
@@ -132,6 +132,19 @@ def _install_task_local_specs(resource: object, specs: tuple[tuple, ...]) -> Non
                 runtime_slot_name=runtime_slot_name,
             ),
         )
+
+
+@cute.jit
+def _k_page_shift(cfg, K, tile_start, cta_v, pk: cutlass.Constexpr[int]):
+    """Token shift of the ``pk``-th K page loaded by CTA ``cta_v`` of the tile."""
+    page_slot = (
+        Int32(0)
+        if cutlass.const_expr(cfg.pages_per_k_tile == 1)
+        else cta_v * Int32(cfg.pages_per_k_cta) + Int32(pk)
+    )
+    return page_token_shift(
+        K, tile_start + page_slot * Int32(cfg.page_size), cfg.page_size
+    )
 
 
 @dataclass(kw_only=True)
@@ -1001,6 +1014,19 @@ class SmemKVResource(HighThroughputMlaResource):
         """TMA load one K or delayed-V sub-tile into the shared KV ring."""
         cfg = self.cfg
         stage_idx = stage_info.stage_idx
+        work_tile = stage_info.work_tile
+        K = Int32(work_tile.k_len)
+        # V is deferred by one K tile inside the domain loop; the tail loads
+        # the final tile's V.  Shifts below are relative to that tile.
+        if cutlass.const_expr(is_v and use_next_v_pages):
+            local_tile_idx = Int32(stage_info.loop_end) - Int32(1)
+        elif cutlass.const_expr(is_v):
+            local_tile_idx = Int32(stage_info.loop_offset) - Int32(1)
+        else:
+            local_tile_idx = Int32(stage_info.loop_offset)
+        tile_start = (work_tile.k_index_base + local_tile_idx) * Int32(
+            cfg.mma_qk_tiler[1]
+        )
 
         kc_page_smem_elems = cfg.kc_page_tile_size * cfg.mma_qk_tiler_k
         kv_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
@@ -1028,6 +1054,11 @@ class SmemKVResource(HighThroughputMlaResource):
                 logical_k_call = k_call * cfg.kv_subtiles_per_stage + stage_subtile_idx
                 coord_kcl = cutlass.Int32(logical_k_call * cfg.mma_qk_tiler_k)
                 for pk in cutlass.range_constexpr(pages_per_k_cta):
+                    coord_n_k_pk = coord_n_k
+                    if cutlass.const_expr(cfg.kv_tail_shift):
+                        coord_n_k_pk = coord_n_k - _k_page_shift(
+                            cfg, K, tile_start, cta_v, pk
+                        )
                     if prims.elect_sync():
                         kcl_smem = cutlass.Array(
                             self.smem_kv.data_ptr(
@@ -1040,7 +1071,7 @@ class SmemKVResource(HighThroughputMlaResource):
                         prims.cp_async_bulk_tensor_shared_cluster_global(
                             kcl_smem,
                             self.tma_desc_c_latent,
-                            (coord_kcl, coord_n_k, cutlass.Int32(cached_k[pk])),
+                            (coord_kcl, coord_n_k_pk, cutlass.Int32(cached_k[pk])),
                             kv_mbar_arr,
                             [],
                             multicast_mask=mask_k,
@@ -1057,6 +1088,11 @@ class SmemKVResource(HighThroughputMlaResource):
                 cfg.mma_qk_tiler[1] // cfg.num_mma_ctas * cfg.mma_qk_rope_tiler[2]
             )
             for pk in cutlass.range_constexpr(pages_per_k_cta):
+                coord_n_k_pk = coord_n_k
+                if cutlass.const_expr(cfg.kv_tail_shift):
+                    coord_n_k_pk = coord_n_k - _k_page_shift(
+                        cfg, K, tile_start, cta_v, pk
+                    )
                 if prims.elect_sync():
                     kcr_smem = cutlass.Array(
                         self.smem_kv.data_ptr(
@@ -1068,7 +1104,7 @@ class SmemKVResource(HighThroughputMlaResource):
                     prims.cp_async_bulk_tensor_shared_cluster_global(
                         kcr_smem,
                         self.tma_desc_c_rope,
-                        (coord_kcr, coord_n_k, cutlass.Int32(cached_k[pk])),
+                        (coord_kcr, coord_n_k_pk, cutlass.Int32(cached_k[pk])),
                         kv_mbar_arr,
                         [],
                         multicast_mask=mask_k,
@@ -1090,7 +1126,7 @@ class SmemKVResource(HighThroughputMlaResource):
                         prims.cp_async_bulk_tensor_shared_cluster_global(
                             kcr_smem_dup,
                             self.tma_desc_c_rope,
-                            (coord_kcr, coord_n_k, cutlass.Int32(cached_k[pk])),
+                            (coord_kcr, coord_n_k_pk, cutlass.Int32(cached_k[pk])),
                             kv_mbar_arr,
                             [],
                             multicast_mask=mask_k,
@@ -1125,9 +1161,17 @@ class SmemKVResource(HighThroughputMlaResource):
                 coord_nj = coord_n_v + cutlass.Int32(pv_j * cfg.mma_pv_tiler[1])
 
                 for pk in cutlass.range_constexpr(pages_per_v_subtile):
-                    k_idx_i = cached_v[
+                    page_slot = (
                         pk + pv_i // cfg.v_subtiles_per_page * pages_per_v_subtile
-                    ]
+                    )
+                    k_idx_i = cached_v[page_slot]
+                    coord_k_v_pk = coord_k_v
+                    if cutlass.const_expr(cfg.kv_tail_shift):
+                        coord_k_v_pk = coord_k_v - page_token_shift(
+                            K,
+                            tile_start + Int32(page_slot * cfg.page_size),
+                            cfg.page_size,
+                        )
                     if prims.elect_sync():
                         # Keep both 64-wide V panels contiguous within each
                         # K32 slice; the next K32 slice follows the complete
@@ -1148,7 +1192,7 @@ class SmemKVResource(HighThroughputMlaResource):
                         prims.cp_async_bulk_tensor_shared_cluster_global(
                             v_smem_0,
                             self.tma_desc_c_transpose,
-                            (coord_nj, coord_k_v, k_idx_i),
+                            (coord_nj, coord_k_v_pk, k_idx_i),
                             kv_mbar_arr,
                             [],
                             multicast_mask=mask_v,
@@ -1167,7 +1211,7 @@ class SmemKVResource(HighThroughputMlaResource):
                             self.tma_desc_c_transpose,
                             (
                                 coord_nj + V_TMA_LATENT_ELEMENTS,
-                                coord_k_v,
+                                coord_k_v_pk,
                                 k_idx_i,
                             ),
                             kv_mbar_arr,
@@ -1324,6 +1368,15 @@ class SmemKResource(HighThroughputMlaResource):
                 page_idx = Int32(0)
                 if cute.elem_less(logical_page_idx, page_offsets_batch.shape[0]):
                     page_idx = page_offsets_batch[logical_page_idx]
+                # logical_page_idx is request relative: its first key is
+                # logical_page_idx * page_size.
+                coord_n_k_pk = coord_n_k
+                if cutlass.const_expr(cfg.kv_tail_shift):
+                    coord_n_k_pk = coord_n_k - page_token_shift(
+                        Int32(work_tile.k_len),
+                        logical_page_idx * Int32(cfg.page_size),
+                        cfg.page_size,
+                    )
                 if prims.elect_sync():
                     kcl_smem = cutlass.Array(
                         self.smem_k.data_ptr(subtile_base + pk * kc_page_smem_elems),
@@ -1332,7 +1385,7 @@ class SmemKResource(HighThroughputMlaResource):
                     prims.cp_async_bulk_tensor_shared_cluster_global(
                         kcl_smem,
                         self.tma_desc_c_latent,
-                        (coord_kcl, coord_n_k, cutlass.Int32(page_idx)),
+                        (coord_kcl, coord_n_k_pk, cutlass.Int32(page_idx)),
                         kv_mbar_arr,
                         [],
                         multicast_mask=mask_k,
@@ -1358,6 +1411,13 @@ class SmemKResource(HighThroughputMlaResource):
                 page_idx = Int32(0)
                 if cute.elem_less(logical_page_idx, page_offsets_batch.shape[0]):
                     page_idx = page_offsets_batch[logical_page_idx]
+                coord_n_k_pk = coord_n_k
+                if cutlass.const_expr(cfg.kv_tail_shift):
+                    coord_n_k_pk = coord_n_k - page_token_shift(
+                        Int32(work_tile.k_len),
+                        logical_page_idx * Int32(cfg.page_size),
+                        cfg.page_size,
+                    )
                 if prims.elect_sync():
                     kcr_smem = cutlass.Array(
                         self.smem_k.data_ptr(subtile_base + pk * rope_page_smem_elems),
@@ -1366,7 +1426,7 @@ class SmemKResource(HighThroughputMlaResource):
                     prims.cp_async_bulk_tensor_shared_cluster_global(
                         kcr_smem,
                         self.tma_desc_c_rope,
-                        (coord_kcr, coord_n_k, cutlass.Int32(page_idx)),
+                        (coord_kcr, coord_n_k_pk, cutlass.Int32(page_idx)),
                         kv_mbar_arr,
                         [],
                         multicast_mask=mask_k,
@@ -1497,12 +1557,18 @@ class SmemVResource(HighThroughputMlaResource):
                 local_token_offset = copy_idx * cfg.v_tma_token_count
                 tile_token_offset = pv_i * cfg.mma_pv_tiler[2] + local_token_offset
                 page_offset = tile_token_offset // cfg.page_size
-                coord_k_v = Int32(tile_token_offset % cfg.page_size)
                 logical_page_idx = (
                     k_index
                     if pages_per_v_tile == 1
                     else k_index * Int32(pages_per_v_tile) + Int32(page_offset)
                 )
+                coord_k_v = Int32(tile_token_offset % cfg.page_size)
+                if cutlass.const_expr(cfg.kv_tail_shift):
+                    coord_k_v = coord_k_v - page_token_shift(
+                        Int32(work_tile.k_len),
+                        logical_page_idx * Int32(cfg.page_size),
+                        cfg.page_size,
+                    )
                 page_idx = Int32(0)
                 if cute.elem_less(logical_page_idx, page_offsets_batch.shape[0]):
                     page_idx = page_offsets_batch[logical_page_idx]
@@ -2063,16 +2129,42 @@ class TmemSResource(HighThroughputMlaResource):
             tidx_col = (
                 local_tidx >> EPILOGUE_COLUMN_GROUP_SHIFT
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
-            for i in cutlass.range_constexpr(64):
-                token_idx = tile_offset_k + tidx_col + Int32(i)
+            # The loaders shift each page by page_token_shift rows: smem row r
+            # of a page holds key page_start + r - shift and rows r < shift are
+            # TMA zero-fill.  This thread's 64 columns are page aligned, so the
+            # shift is evaluated once per page-sized column group.
+            group = min(cfg.page_size, 64)
+            for g in cutlass.range_constexpr(64 // group):
+                page_col = (
+                    (tidx_col + Int32(g * group)) // Int32(cfg.page_size)
+                ) * Int32(cfg.page_size)
+                shift = Int32(0)
+                if cutlass.const_expr(cfg.kv_tail_shift):
+                    shift = page_token_shift(K, tile_offset_k + page_col, cfg.page_size)
+                first_visible_col = page_col + shift
                 if cutlass.const_expr(needs_row_causal_mask):
-                    mask_flat_row = Int32(self.logical_num_heads_q) * (
-                        token_idx - K + logical_seq_len_q
+                    # H * (key_pos - K + SQ) with key_pos = tile_offset_k + col - shift.
+                    causal_bias = Int32(self.logical_num_heads_q) * (
+                        tile_offset_k - shift - K + logical_seq_len_q
                     )
-                    token_is_visible = flat_query_row >= mask_flat_row
-                else:
-                    token_is_visible = token_idx < K
-                qk_acc_regs[i] = qk_acc_regs[i] if token_is_visible else neg_inf
+                for i in cutlass.range_constexpr(g * group, (g + 1) * group):
+                    col = tidx_col + Int32(i)
+                    if cutlass.const_expr(needs_row_causal_mask):
+                        # The causal threshold already excludes keys >= K;
+                        # only shifted tiles must also drop the zero-fill rows.
+                        mask_flat_row = (
+                            Int32(self.logical_num_heads_q) * col + causal_bias
+                        )
+                        token_is_visible = flat_query_row >= mask_flat_row
+                        if cutlass.const_expr(cfg.kv_tail_shift):
+                            token_is_visible = token_is_visible & (
+                                col >= first_visible_col
+                            )
+                    elif cutlass.const_expr(cfg.kv_tail_shift):
+                        token_is_visible = col >= first_visible_col
+                    else:
+                        token_is_visible = tile_offset_k + col < K
+                    qk_acc_regs[i] = qk_acc_regs[i] if token_is_visible else neg_inf
 
         max0 = neg_inf
         max1 = neg_inf
