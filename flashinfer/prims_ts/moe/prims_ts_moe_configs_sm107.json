@@ -168,6 +168,7 @@
             "tile_scheduler": "persistent",
             "mma_n,tile_n,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_stages_tmem_acc,use_tma_store,use_clc_fast_drain,use_work_throttle": [
                 [16, 16, 16, 5, 5, 5, 5, 5, 5, 2, true, false, false],
+                [8, 8, 8, 5, 2, 4, 3, 5, 5, 1, false, true, true],
                 [8, 8, 8, 5, 3, 4, 3, 5, 5, 1, false, true, true]
             ],
             "fused_act,act,eltwise_act_type": [
@@ -189,6 +190,7 @@
             "use_work_throttle": true,
             "mma_n,tile_n,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_stages_tmem_acc,num_load_sfb_warps,mma_regs,load_regs,epilogue_regs,use_tma_oob_opt": [
                 [16, 16, 16, 6, 4, 5, 5, 7, 7, 4, 1, 48, 48, 160, true],
+                [32, 32, 32, 5, 3, 4, 6, 9, 5, 4, 1, 64, 64, 128, true],
                 [32, 32, 32, 5, 4, 4, 4, 7, 6, 3, 4, 64, 64, 128, false],
                 [32, 32, 32, 5, 4, 4, 4, 8, 4, 4, 1, 64, 64, 128, true]
             ],
@@ -245,6 +247,36 @@
             ],
             "fused_act,act,eltwise_act_type": [
                 [false, "none", "relu2"]
+            ],
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32"
+        },
+        {
+            "_comment": "FP4_FC1_1Cta_N64_K256_Gated",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "sf_layout_b": "linear",
+            "mma_n": 64,
+            "tile_n": 64,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            "num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 7, 8, 6, 5, 5]
+            ],
+            "num_stages_tmem_acc": 4,
+            "num_stages_c_smem": 2,
+            "num_load_b_warps": 4,
+            "num_load_sfb_warps": 8,
+            "mma_regs,load_regs,load_a_regs,load_b_regs,load_sf_regs,load_sfa_regs,copy_sf_regs,padding_regs,workid_regs,epilogue_regs": [
+                [48, 48, 48, 48, 48, 48, 48, 48, 48, 160]
+            ],
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true,
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"]
             ],
             "use_per_token_sf_b": [true, false],
             "per_token_sf_dtype": "fp32"
@@ -339,6 +371,30 @@
             "use_work_throttle": true,
             "fused_act,act,eltwise_act_type": [
                 [false, "none", "relu2"]
+            ],
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32"
+        },
+        {
+            "_comment": "FP4_FC1_2Cta_N64_K512_Gated_d09b",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "sf_layout_b": "linear",
+            "sf_layout_c": "8x4",
+            "mma_n": 64,
+            "tile_n": 64,
+            "cluster_dim_x": 2,
+            "num_stages_c_smem": 2,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true,
+            "route_act,route_sfs_act,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_stages_tmem_acc,num_load_b_warps,num_load_sfb_warps,mma_regs,load_regs,load_a_regs,load_b_regs,load_sf_regs,load_sfa_regs,copy_sf_regs,padding_regs,workid_regs,epilogue_regs": [
+                ["ldgsts", "tma", 64, 6, 6, 16, 6, 6, 6, 3, 2, 4, 48, 48, 48, 48, 48, 48, 48, 48, 48, 160],
+                ["ldgsts", "ldgsts", 32, 5, 5, 3, 3, 5, 5, 4, 4, 4, 64, 64, 48, 48, 48, 48, 48, 64, 64, 176],
+                ["tma", "tma", 64, 6, 6, 13, 9, 6, 6, 3, 4, 8, 48, 48, 48, 48, 48, 48, 48, 48, 48, 160]
+            ],
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"]
             ],
             "use_per_token_sf_b": [true, false],
             "per_token_sf_dtype": "fp32"
@@ -467,6 +523,36 @@
             "per_token_sf_dtype": "fp32"
         },
         {
+            "_comment": "FP4_FC1_2Cta_N128_K512_FusedSf_Gated",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "sf_layout_b": "linear",
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 32,
+            "num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [4, 4, 4, 4, 1, 1]
+            ],
+            "num_stages_tmem_acc": 2,
+            "num_stages_c_smem": 1,
+            "num_load_sfb_warps": 4,
+            "mma_regs,load_regs,load_b_regs,load_sfb_regs,epilogue_regs": [
+                [48, 48, 128, 128, 160]
+            ],
+            "fuse_sf_copy_to_mma": true,
+            "fuse_operand_sf_loads": true,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true,
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"]
+            ],
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32"
+        },
+        {
             "_comment": "FP4_FC1_2Cta_N256_K256_FusedSf_MaxOverlap",
             "_template": "BatchedGemmFp4HighThroughput",
             "route_act": "tma",
@@ -580,6 +666,8 @@
                 [16, 16, 16, 256, 8, 6, 7, 7, 3, 7, 4, 2, 48, 48, 160, false, true],
                 [16, 16, 16, 256, 8, 8, 9, 9, 9, 9, 2, 2, 48, 48, 160, true, true],
                 [16, 16, 16, 512, 3, 2, 4, 2, 2, 3, 2, 2, 64, 64, 128, false, true],
+                [16, 16, 16, 512, 4, 2, 3, 8, 2, 4, 4, 2, 32, 32, 192, false, true],
+                [16, 16, 16, 512, 4, 6, 3, 4, 2, 4, 4, 2, 32, 32, 192, false, true],
                 [16, 16, 16, 512, 5, 4, 5, 5, 2, 4, 4, 2, 32, 32, 192, false, true],
                 [32, 32, 32, 256, 6, 6, 6, 6, 6, 6, 2, 2, 48, 48, 160, true, true],
                 [64, 64, 64, 256, 8, 10, 6, 7, 5, 6, 6, 2, 48, 48, 160, true, true],
